@@ -190,7 +190,7 @@ const CFG = {
   SHEET_ID: '1zCiCH3L1fVBBMnqhdinwmlH3wCE841rFjM3RvgW2zmo',
   // Paste your Publish-to-web id here (the 2PACX-… part) to make live sync automatic for everyone, no clicks:
   PUBLISHED_ID: '',
-  GID: { inventory:'0', sales:'147084092', stores:'626561110', key:'473544937' },
+  GID: { inventory:'0', sales:'147084092', stores:'626561110', key:'473544937', pairing:'66932344' },
   REFRESH_MS: 90000,
   SMALL_SIZES: ['XS','S','M'],          // "smaller sizes" for fast-size alerts & allocation
   FAST_WINDOW_DAYS: 2,                   // Feature 1 lookback
@@ -204,7 +204,7 @@ const SIZE_ORDER = ['XS','S','M','L','XL','XXL'];
 const csvUrl = gid => `https://docs.google.com/spreadsheets/d/${CFG.SHEET_ID}/gviz/tq?tqx=out:csv&gid=${gid}`;
 
 /* ===================== STATE ===================== */
-let RAW = { inventory:[], sales:[], stores:[], key:[] };
+let RAW = { inventory:[], sales:[], stores:[], key:[], pairing:[] };
 let STOREMAP = {};            // CODE -> {name, type}
 let M = {};                   // computed model object
 let acked = new Set();        // acknowledged alert keys
@@ -256,11 +256,16 @@ function nsize(z){
   if(SIZE_ORDER.includes(z)) return z;
   return null;
 }
-function compOf(sub,cat){
-  const s=(sub||'').toLowerCase(), c=(cat||'').toLowerCase();
-  if(s==='kurta') return 'Kurta';
-  if(s==='pant') return 'Pant';
-  if(s==='chunni'||c==='dupatta') return 'Dupatta';
+function compOf(...fields){
+  const parts=fields.map(x=>(x||'').toString().toLowerCase());
+  const primary=parts[0]||'';                                  // Sub Category (sales) or Hierarchy Code (inventory)
+  if(/^\s*kurta/.test(primary)) return 'Kurta';
+  if(/^\s*pant/.test(primary))  return 'Pant';
+  if(/^\s*(chunni|dupatta)/.test(primary)) return 'Dupatta';
+  const s=' '+parts.join(' ')+' ';                             // fall back to keyword search across all fields
+  if(/\b(dupatta|chunni|odhani|odhna|stole|chunari)\b/.test(s)) return 'Dupatta';
+  if(/\b(pant|pants|palazzo|palazzos|trouser|trousers|salwar|churidar|sharara|garara|dhoti|culotte|pyjama|pajama|legging|leggings|skirt)\b/.test(s)) return 'Pant';
+  if(/\b(kurta|kurti|kurtas|tunic|top|tops|blouse|choli|anarkali|kaftan|kaftaan|jacket|shrug|cape|gown|dress|jumpsuit|coord|co-ord)\b/.test(s)) return 'Kurta';
   return 'Other';
 }
 const modelOf = desc => (String(desc).trim().split(/\s+/)[0]||'').toUpperCase();
@@ -365,13 +370,14 @@ async function fetchTab(gid, re){
   throw new Error('unreachable');
 }
 async function loadAll(){
-  const [inv,sal,sto,key] = await Promise.all([
+  const [inv,sal,sto,key,pair] = await Promise.all([
     fetchTab(CFG.GID.inventory, /available\s*qty|loccode/i),
     fetchTab(CFG.GID.sales,     /externorderno|orderdate/i),
     fetchTab(CFG.GID.stores,    /location\s*code/i),
     fetchTab(CFG.GID.key,       /sku\s*code|sku\s*name/i).catch(()=>[]),
+    fetchTab(CFG.GID.pairing,   /product\s*1\s*sku|product\s*2\s*sku/i).catch(()=>[]),
   ]);
-  RAW={inventory:inv,sales:sal,stores:sto,key:key};
+  RAW={inventory:inv,sales:sal,stores:sto,key:key,pairing:pair};
 }
 
 /* ===================== TRANSFORM + COMPUTE ===================== */
@@ -425,7 +431,7 @@ function build(){
     const rawDate=col(r,'OrderDate');
     const d=parseDate(rawDate);
     const st=storeOf(col(r,'ExternOrderNo'), col(r,'Sold out by Channel'));
-    const comp=compOf(col(r,'Sub Category'), col(r,'Category'));
+    const comp=compOf(col(r,'Sub Category'), col(r,'SKU Desc'), col(r,'Category'));
     const sku=col(r,'SKU');
     const rec={
       date:d, store:st.name, stype:st.type, scode:st.code,
@@ -442,11 +448,11 @@ function build(){
   // inventory records
   const inv=[];
   RAW.inventory.forEach(r=>{
-    const comp=compOf(col(r,'Hierarchy Code'), col(r,'Collection'));
+    const comp=compOf(col(r,'Hierarchy Code'), col(r,'SKU Desc'), col(r,'Collection'));
     const sku=col(r,'SKU');
     inv.push({
       model:modelOf(col(r,'SKU Desc')), desc:col(r,'SKU Desc'), sku,
-      comp, size:nsize(col(r,'Size')), color:colorOf(sku, ''),
+      comp, size:nsize(col(r,'Size')), color:normColor(col(r,'Colour','Color'))||colorOf(sku,''),
       avail:numv(col(r,'Available Qty')), total:numv(col(r,'Total Qty')),
       committed:numv(col(r,'Committed Qty')), transit:numv(col(r,'InTransit Qty')),
       loc:col(r,'LocCode').toUpperCase(), locName:col(r,'Site Location'),
@@ -499,10 +505,11 @@ function build(){
   const fastSize=aggFast(sales, storeOnHand, dataNow, CFG.FAST_WINDOW_DAYS, CFG.SIZE_ALERT_MIN_UNITS, 'small', hasStoreInv)
                    .filter(r=>r.flagged).slice(0,50);
 
-  /* model+colour aggregates */
+  /* style+colour velocity aggregates (inventory now carries colour) */
   const mc={};
-  const touchMC=(m,c)=>mc[m+'||'+c]=mc[m+'||'+c]||{model:m,color:c,comps:new Set(),units7:0,u7c:{Kurta:0,Pant:0,Dupatta:0},
-    onhand:{Kurta:0,Pant:0,Dupatta:0,total:0}, revenue7:0};
+  const ckey=c=>normColor(c).toUpperCase();
+  const touchMC=(m,c)=>{const k=m+'||'+ckey(c); return mc[k]=mc[k]||{model:m,color:normColor(c),comps:new Set(),
+    units7:0,u7c:{Kurta:0,Pant:0,Dupatta:0}, onhand:{Kurta:0,Pant:0,Dupatta:0,total:0}, revenue7:0};};
   sales.forEach(s=>{ if(s.comp==='Other')return; const mo=touchMC(s.model,s.color||''); mo.comps.add(s.comp);
     if(s.date&&s.date>=w7){ mo.units7+=s.qty; mo.u7c[s.comp]+=s.qty; mo.revenue7+=s.qty*s.mrp; } });
   inv.forEach(i=>{ if(i.comp==='Other')return; const mo=touchMC(i.model,i.color||'');
@@ -521,36 +528,60 @@ function build(){
             coverWk, sellThru, revenue7:mo.revenue7, flag};
   }).sort((a,b)=>b.units7-a.units7);
 
-  /* Feature 3 — set completion per style+colour (a set completes within one colourway) */
-  const setMC=Object.values(mc).filter(mo=>{
-    const hasInv=['Kurta','Pant','Dupatta'].filter(c=>mo.onhand[c]>0).length;
-    return (mo.comps.has('Kurta')&&(mo.comps.has('Dupatta')||mo.comps.has('Pant'))) || hasInv>=2;
+  /* Feature 3 — set completion from the Styles Pairing sheet (authoritative SKU→SKU pairings) */
+  const invBySku={};
+  inv.forEach(i=>{ const k=String(i.sku||'').trim().toUpperCase(); if(!k) return;
+    const e=invBySku[k]||(invBySku[k]={avail:0,color:i.color,desc:i.desc,comp:i.comp});
+    e.avail+=i.avail; if(!e.color&&i.color)e.color=i.color; });
+  const setAgg={}; let pairDefs=0, pairMatched=0, pairSkuTotal=0;
+  (RAW.pairing||[]).forEach(r=>{
+    const prods=[
+      {sku:String(col(r,'Product 1 SKU')||'').trim(), name:String(col(r,'Product 1')||'').trim()},
+      {sku:String(col(r,'Product 2 SKU')||'').trim(), name:String(col(r,'Product 2')||'').trim()},
+      {sku:String(col(r,'Product 3 SKU')||'').trim(), name:String(col(r,'Product 3')||'').trim()},
+    ].filter(p=>p.sku && p.sku!=='0' && p.name && p.name!=='0');
+    if(prods.length<2) return;                              // standalone item (saree/dress) — not a set
+    pairDefs++;
+    const label=prods[0].name;
+    const colour=invBySku[prods[0].sku.toUpperCase()]?.color || '';
+    const key=String(col(r,'Key')||(label+'|'+colour)).trim();
+    const g=setAgg[key]||(setAgg[key]={key,label,colour,k:0,p:0,d:0,present:new Set(),matched:0,total:0});
+    if(!g.colour&&colour) g.colour=colour;
+    prods.forEach(p=>{
+      g.total++; pairSkuTotal++;
+      const e=invBySku[p.sku.toUpperCase()]; const av=e?e.avail:0; if(e){g.matched++; pairMatched++;}
+      let c=compOf(p.name); if(c==='Other') c='Kurta';     // P1 tops (Top/Dress) bucket as the lead garment
+      if(c==='Kurta') g.k+=av; else if(c==='Pant') g.p+=av; else g.d+=av;
+      g.present.add(c);
+    });
   });
-  const inwardSets = setMC.map(mo=>{
-    const k=mo.onhand.Kurta, p=mo.onhand.Pant, d=mo.onhand.Dupatta;
-    const have={Kurta:k,Pant:p,Dupatta:d};
-    const sets=Math.min(k,p,d), mx=Math.max(k,p,d);
-    const pending=['Kurta','Pant','Dupatta'].filter(c=>have[c]<mx).map(c=>({c,n:mx-have[c]})).filter(x=>x.n>0);
-    return {model:mo.model,color:mo.color,k,p,d,sets,pending};
+  const inwardSets=Object.values(setAgg).map(g=>{
+    const present=[...g.present], vals={Kurta:g.k,Pant:g.p,Dupatta:g.d};
+    const avails=present.map(c=>vals[c]);
+    const sets=avails.length?Math.min(...avails):0, mx=avails.length?Math.max(...avails):0;
+    const pending=present.filter(c=>vals[c]<mx).map(c=>({c,n:mx-vals[c]})).filter(x=>x.n>0);
+    return {model:g.label,color:g.colour,k:g.k,p:g.p,d:g.d,sets,pending,matched:g.matched,total:g.total};
   }).filter(s=>(s.k+s.p+s.d)>0).sort((a,b)=>{
     const ap=a.pending.reduce((x,y)=>x+y.n,0),bp=b.pending.reduce((x,y)=>x+y.n,0); return bp-ap;
   });
   const incompleteSets=inwardSets.filter(s=>s.pending.length>0);
+  diag.tabPairing=(RAW.pairing||[]).length; diag.pairDefs=pairDefs;
+  diag.pairMatched=pairMatched; diag.pairSkuTotal=pairSkuTotal;
 
-  // store-level missing piece, per store+style+colour (needs store inventory rows)
+  // store-level missing piece, per store+style (inventory carries no colour)
   const storeInv={};
   inv.forEach(i=>{ if(i.ltype!=='Stores'||i.comp==='Other')return;
-    const k=i.loc+'|'+i.model+'|'+(i.color||''); storeInv[k]=storeInv[k]||{loc:i.loc,model:i.model,color:i.color||'',Kurta:0,Pant:0,Dupatta:0};
+    const k=i.loc+'|'+i.model; storeInv[k]=storeInv[k]||{loc:i.loc,model:i.model,color:'',Kurta:0,Pant:0,Dupatta:0};
     storeInv[k][i.comp]+=i.avail; });
-  const whAvail=(model,color,comp)=>inv.filter(i=>i.model===model&&(i.color||'')===color&&i.comp===comp&&i.ltype==='Warehouse').reduce((a,i)=>a+i.avail,0);
+  const whAvail=(model,comp)=>inv.filter(i=>i.model===model&&i.comp===comp&&i.ltype==='Warehouse').reduce((a,i)=>a+i.avail,0);
   const dispatchSets=Object.values(storeInv).map(si=>{
     const comps=['Kurta','Pant','Dupatta']; const have=comps.filter(c=>si[c]>0);
     const missing=comps.filter(c=>si[c]===0);
     if(have.length>=2 && missing.length>=1){
       const need=Math.max(...comps.map(c=>si[c]));
-      const miss=missing[0]; const wh=whAvail(si.model,si.color,miss);
+      const miss=missing[0]; const wh=whAvail(si.model,miss);
       return {store:shortName(STOREMAP[si.loc]?.name||si.loc),model:si.model,color:si.color,
-              k:si.Kurta,p:si.Pant,d:si.Dupatta,miss,need,wh,key:'f3|'+si.loc+si.model+si.color};
+              k:si.Kurta,p:si.Pant,d:si.Dupatta,miss,need,wh,key:'f3|'+si.loc+si.model};
     } return null;
   }).filter(Boolean).sort((a,b)=>b.need-a.need).slice(0,20);
 
@@ -727,7 +758,7 @@ function computeAlloc(){
 }
 
 function renderSets(){
-  let h=`<p class="lead">Every set = <b>Kurta + Pant + Dupatta</b> in the <b>same colourway</b> (matched by style name + colour). ARS checks integrity at <b>inward</b> (do component counts form whole sets?) and at <b>store</b> (is a sold-out single piece breaking otherwise-complete sets?).</p>
+  let h=`<p class="lead">Every set is defined in your <b>Styles Pairing Sheet</b> (Product 1 + Product 2 + Product 3 by SKU). ARS looks up live stock for each component, so a set completes only when all its paired pieces are available in the same colourway. Checked at <b>inward</b> (do the paired counts form whole sets?) and at <b>store</b> (is one sold-out piece breaking otherwise-complete sets?).</p>
   <div class="legend" style="margin-bottom:14px"><span><span class="compdot" style="background:var(--indigo)"></span> Kurta</span>
     <span><span class="compdot" style="background:var(--marigold)"></span> Pant</span><span><span class="compdot" style="background:var(--teal)"></span> Dupatta</span></div>`;
   const inc=M.incompleteSets.slice(0,25);
@@ -758,7 +789,7 @@ function renderSets(){
 
 function renderFast(){
   const rows=M.fastStyles.slice(0,40);
-  let h=`<p class="lead"><b>Trigger:</b> a style+colour with ≥${(CFG.REORDER_SELLTHRU*100)}% sell-through or under ${CFG.REORDER_COVER_WK} weeks of cover, based on last ${CFG.VELO_WINDOW_DAYS} days of sales vs available stock (lead garment). Each <b>colourway</b> is tracked on its own so you re-order the exact colour that's moving.</p>`;
+  let h=`<p class="lead"><b>Trigger:</b> a style with ≥${(CFG.REORDER_SELLTHRU*100)}% sell-through or under ${CFG.REORDER_COVER_WK} weeks of cover, based on last ${CFG.VELO_WINDOW_DAYS} days of sales vs available stock (lead garment). Sell-through and cover use stock on hand, which has no colour in the feed, so this is tracked per style.</p>`;
   h+=`<div class="card"><div class="card-h"><h3>↗ Style velocity &amp; re-order reminders</h3><div class="sub">Live, last ${CFG.VELO_WINDOW_DAYS} days · by style &amp; colour</div></div>
     <table><thead><tr><th>Style</th><th>Colour</th><th class="r">Sold (7d)</th><th>Lead</th><th class="r">Stock o/h</th><th>Sell-through</th><th class="r">Cover</th><th class="r">Value 7d</th><th>Status</th></tr></thead><tbody>`+
     (rows.length?rows.map(r=>{const st=Math.round(r.sellThru*100);
@@ -1078,6 +1109,7 @@ function renderData(){
         <span>Other/unmatched component: <b style="color:${(g.nOther&&g.nOther===g.nSales)?'var(--terracotta)':'var(--ink-soft)'}">${g.nOther??'—'}</b></span>
       </div>
       <div style="font-size:12.5px;color:var(--ink-soft);margin:8px 0">Store codes detected: ${(g.storeCodes&&g.storeCodes.length)?g.storeCodes.map(c=>`<span class="store-tag">${c}</span>`).join(' '):'<b style="color:var(--terracotta)">none — order-number prefixes did not match the Stores tab</b>'}</div>
+      <div style="font-size:12.5px;color:var(--ink-soft);margin:8px 0">Styles Pairing: <b>${g.tabPairing??'—'}</b> rows · <b>${g.pairDefs??'—'}</b> multi-piece sets · SKUs matched to inventory: <b style="color:${(g.pairMatched&&g.pairSkuTotal&&g.pairMatched/g.pairSkuTotal>0.5)?'var(--teal)':'var(--terracotta)'}">${g.pairMatched??'—'} / ${g.pairSkuTotal??'—'}</b> ${(g.pairSkuTotal&&g.pairMatched/g.pairSkuTotal<0.5)?'— low match means pairing SKUs do not align with inventory SKUs':''}</div>
       <table style="margin-top:6px"><thead><tr><th>Raw OrderDate</th><th>Parsed</th><th>Order #</th><th>Store</th><th>Type</th><th>Size</th><th>Sub Cat</th><th>Comp</th></tr></thead><tbody>`+
       ((g.samples&&g.samples.length)?g.samples.map(s=>`<tr><td style="font-family:var(--mono);font-size:12px">${s.raw||'—'}</td>
         <td style="color:${s.parsed.includes('✗')?'var(--terracotta)':'var(--teal)'}">${s.parsed}</td>
@@ -1160,7 +1192,7 @@ function mountFallback(target){
       </div>
     </div>
     <div style="text-align:center;color:var(--muted);font-size:12px;margin:12px 0 8px">— or load today’s data with no setup —</div>
-    <div class="drop" id="dz">⤓ Drop the 4 tab CSVs here (or click) — File ▸ Download ▸ CSV for each tab
+    <div class="drop" id="dz">⤓ Drop the 5 tab CSVs here (or click) — File ▸ Download ▸ CSV for each tab
       <input type="file" id="fz" accept=".csv" multiple class="hide"></div>`;
   const dz=host.querySelector('#dz'), fz=host.querySelector('#fz');
   dz.onclick=()=>fz.click();
@@ -1176,6 +1208,7 @@ async function handleFiles(files){
     if(/externorderno|orderdate/.test(keys)) RAW.sales=objs;
     else if(/available\s*qty|loccode/.test(keys)) RAW.inventory=objs;
     else if(/location\s*code/.test(keys)) RAW.stores=objs;
+    else if(/product\s*1\s*sku|product\s*2\s*sku/.test(keys)) RAW.pairing=objs;
     else if(/sku\s*name|sku\s*code/.test(keys)) RAW.key=objs;
   }
   if(RAW.sales.length && RAW.inventory.length){
