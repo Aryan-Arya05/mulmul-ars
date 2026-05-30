@@ -136,12 +136,37 @@
   @keyframes rot{to{transform:rotate(360deg)}}
   .drop{border:2px dashed var(--line-strong);border-radius:12px;padding:20px;text-align:center;color:var(--ink-soft);font-size:13px;background:var(--surface-2)}
   .hide{display:none!important}
+  .hamburger{display:none;background:var(--surface);border:1px solid var(--line-strong);border-radius:10px;
+    width:40px;height:40px;cursor:pointer;font-size:18px;color:var(--ink);flex-shrink:0;align-items:center;justify-content:center}
+  .scrim{display:none;position:fixed;inset:0;background:rgba(20,26,50,.5);z-index:29;backdrop-filter:blur(2px)}
+  .scrim.show{display:block}
   @media(max-width:1080px){.kpis{grid-template-columns:repeat(3,1fr)}.two,.three{grid-template-columns:1fr}}
-  @media(max-width:760px){.app{grid-template-columns:1fr}.side{display:none}.kpis{grid-template-columns:repeat(2,1fr)}}
+  @media(max-width:760px){
+    .app{grid-template-columns:1fr}
+    .side{position:fixed;top:0;left:0;z-index:30;width:250px;height:100vh;transform:translateX(-100%);
+      transition:transform .26s ease;box-shadow:0 0 40px rgba(0,0,0,.4)}
+    .side.open{transform:translateX(0)}
+    .nav-item.active::before{left:-12px}
+    .hamburger{display:inline-flex}
+    .topbar{padding:11px 14px;gap:11px}
+    .topbar .ey{display:none}
+    .topbar h1{font-size:17px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .topbar > div:not(.top-right){min-width:0}
+    .top-right{gap:7px}
+    .top-right .btn{padding:8px 9px;font-size:12px}
+    .view{padding:16px 13px 64px;max-width:100%}
+    .lead{font-size:13.5px;margin-bottom:14px}
+    .kpis{grid-template-columns:repeat(2,1fr)}
+    .tool{padding:12px;gap:11px}
+    .card table{display:block;overflow-x:auto;white-space:nowrap;-webkit-overflow-scrolling:touch}
+    .card-h{flex-wrap:wrap}
+  }
+  @media(max-width:440px){ .kpis{grid-template-columns:1fr} }
 </style>
 </head>
 <body>
 <div class="app">
+  <div class="scrim" id="scrim" onclick="toggleNav(false)"></div>
   <aside class="side">
     <div class="brand"><div class="logo">M</div><div><b>Mulmul</b><span>ARS Console</span></div></div>
     <div class="nav-label">Replenishment</div>
@@ -161,6 +186,7 @@
   </aside>
   <div class="main">
     <div class="topbar">
+      <button class="hamburger" id="ham" onclick="toggleNav()" aria-label="Open menu">☰</button>
       <div><div class="ey" id="bar-ey">Replenishment</div><h1 id="bar-title">Overview</h1></div>
       <div class="top-right">
         <span class="livechip" id="livechip"><span class="lp"></span> Connecting…</span>
@@ -1134,7 +1160,13 @@ function go(v){
   if(v==='data') mountFallback();
   window.scrollTo(0,0);
 }
-document.querySelectorAll('.nav-item').forEach(n=>n.addEventListener('click',()=>go(n.dataset.view)));
+document.querySelectorAll('.nav-item').forEach(n=>n.addEventListener('click',()=>{go(n.dataset.view);toggleNav(false);}));
+function toggleNav(force){
+  const s=document.querySelector('.side'), sc=document.getElementById('scrim');
+  if(!s||!sc) return;
+  const open = force===undefined ? !s.classList.contains('open') : force;
+  s.classList.toggle('open',open); sc.classList.toggle('show',open);
+}
 function ack(key){ acked.add(key); toast('Action queued'); badges(); if(current==='alerts') fillAlerts(); else go(current); }
 function exportPlan(){
   const lines=[['Type','Style','Colour','Detail','Qty','Store/Loc']];
