@@ -283,21 +283,19 @@ function shortName(n){
   s=s.replace(/public clothing pvt\.?\s*ltd\.?/ig,'').replace(/[()]/g,'').trim();
   return s||n;
 }
+const ONLINE_PREFIXES=['ML','UAE','MA'];
 function storeOf(orderNo,channel){
   const ch=(channel||'').toString().trim().toLowerCase();
-  const m=String(orderNo).match(/^[A-Za-z]+/); const pre=m?m[0].toUpperCase():'';
+  const o=String(orderNo||'').trim();
+  const m=o.match(/^[A-Za-z]+/); const pre=m?m[0].toUpperCase():'';
+  // Online if: no alpha prefix (purely numeric like "5936"), an online-marker prefix, or channel says online
+  if(!pre || ONLINE_PREFIXES.includes(pre) || /online|ecom|web|marketplace/.test(ch))
+    return {code:'ONLINE',name:'Online',type:'Online'};
+  // Otherwise the prefix is a store location code. Use the Stores tab for the proper name + to spot warehouses.
   const known=STOREMAP[pre];
-  // 1) explicit online channel wins
-  if(/online|ecom|web|marketplace/.test(ch)) return {code:'ONLINE',name:'Online',type:'Online'};
-  // 2) known location code → honour its type (tolerant to naming: "Store", "Online Store", etc.)
   if(known){ const t=/wareh/i.test(known.type)?'Warehouse':/online/i.test(known.type)?'Online':'Stores';
     return {code:pre,name:shortName(known.name),type:t}; }
-  // 3) known online markers / no prefix
-  if(['ML','UAE','MA'].includes(pre)) return {code:'ONLINE',name:'Online',type:'Online'};
-  // 4) offline channel, or any alpha-prefixed order we don't recognise → treat as a physical store
-  if(ch==='offline' || pre) return {code:pre||'NA',name:pre||'Store',type:'Stores'};
-  // 5) numeric/blank with no channel → online
-  return {code:'ONLINE',name:'Online',type:'Online'};
+  return {code:pre,name:pre,type:'Stores'};   // unlisted prefix → still a physical store
 }
 function allocate(total,fracs){
   const raw=fracs.map(f=>total*f), base=raw.map(Math.floor);
