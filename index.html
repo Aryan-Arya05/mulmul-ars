@@ -175,6 +175,7 @@
     <div class="nav-item" data-view="alloc"><span class="ico">⊞</span> Smart Allocation</div>
     <div class="nav-item" data-view="sets"><span class="ico">❖</span> Set Completion <span class="cnt muted" id="nav-sets">0</span></div>
     <div class="nav-item" data-view="fast"><span class="ico">↗</span> Fast-Sellers <span class="cnt muted" id="nav-fast">0</span></div>
+    <div class="nav-item" data-view="assort"><span class="ico">▦</span> Store Assortment <span class="cnt muted" id="nav-assort">0</span></div>
     <div class="nav-item" data-view="ai"><span class="ico">✦</span> AI Insights</div>
     <div class="nav-label">System</div>
     <div class="nav-item" data-view="data"><span class="ico">⎙</span> Data &amp; Sync</div>
@@ -225,6 +226,8 @@ const CFG = {
   TARGET_COVER_DAYS: 7,                 // replen sizing horizon
   REORDER_SELLTHRU: 0.70,               // Feature 4 sell-through trigger
   REORDER_COVER_WK: 2.0,                // Feature 4 weeks-of-cover trigger
+  ASSORT_WINDOW_DAYS: 30,               // Store-assortment sell-through lookback
+  ASSORT_KEEP_ST: 0.60,                 // sell-through at/above which a style is "productive" at a store
 };
 const SIZE_ORDER = ['XS','S','M','L','XL','XXL'];
 const csvUrl = gid => `https://docs.google.com/spreadsheets/d/${CFG.SHEET_ID}/gviz/tq?tqx=out:csv&gid=${gid}`;
@@ -407,6 +410,34 @@ async function loadAll(){
 }
 
 /* ===================== TRANSFORM + COMPUTE ===================== */
+/* store-assortment sell-through: per store × style × colour. Pure. */
+function assortVerdict(sold, onhand, sellThru, coverWk, keepThr){
+  if(onhand===0 && sold>0)  return {v:'Reorder', t:'hi'};                  // sold out at store but was selling
+  if(onhand>0  && sold===0) return {v:'Pull',    t:'dead'};                // dead stock — nothing sold in window
+  if(sellThru>=keepThr || (coverWk<2 && sold>0)) return {v:'Keep', t:'ok'};// productive / selling fast
+  if(sellThru<0.25 && coverWk>12)    return {v:'Pull', t:'dead'};          // overstocked slow mover
+  return {v:'Watch', t:'watch'};
+}
+function assortRows(salesRecs, stockMap, dataNow, days, keepThr){
+  const since=new Date(dataNow.getTime()-days*86400000);
+  const sold={};
+  salesRecs.forEach(s=>{ if(s.stype!=='Stores'||!s.date||s.date<since||s.comp==='Other')return;
+    const k=s.scode+'|'+s.model+'|'+(s.color||''); sold[k]=(sold[k]||0)+s.qty; });
+  const keys=new Set([...Object.keys(sold),...Object.keys(stockMap)]);
+  const rows=[];
+  keys.forEach(k=>{
+    const parts=k.split('|'), scode=parts[0], model=parts[1], color=parts[2]||'';
+    const u=sold[k]||0, st=stockMap[k]||{onhand:0,mrp:0,store:(STOREMAP[scode]?shortName(STOREMAP[scode].name):scode)};
+    const onhand=st.onhand;
+    if(u===0 && onhand===0) return;                                        // nothing to say
+    const sellThru=(u+onhand)>0 ? u/(u+onhand) : 0;
+    const wkRate=u/(days/7), coverWk = wkRate>0 ? onhand/wkRate : (onhand>0?99:0);
+    const vd=assortVerdict(u,onhand,sellThru,coverWk,keepThr);
+    rows.push({scode, store:st.store||scode, model, color, sold:u, onhand, sellThru, coverWk,
+               value:Math.round(onhand*(st.mrp||0)), verdict:vd.v, tone:vd.t});
+  });
+  return rows.sort((a,b)=> b.onhand-a.onhand);
+}
 /* aggregate small/all-size movement in a window; pure (no globals except CFG) */
 function aggFast(sales, onHandMap, dataNow, days, minU, scope, storeInvKnown){
   const since=new Date(dataNow.getTime()-days*86400000);
@@ -594,6 +625,17 @@ function build(){
   diag.tabPairing=(RAW.pairing||[]).length; diag.pairDefs=pairDefs;
   diag.pairMatched=pairMatched; diag.pairSkuTotal=pairSkuTotal;
 
+  /* store-assortment: store stock (per store×style×colour) + sell-through */
+  const storeStock={};
+  inv.forEach(i=>{ if(i.ltype!=='Stores'||i.comp==='Other')return;
+    const k=i.loc+'|'+i.model+'|'+(i.color||'');
+    const e=storeStock[k]||(storeStock[k]={onhand:0,mrp:i.mrp,store:shortName(STOREMAP[i.loc]?.name||i.loc)});
+    e.onhand+=i.avail; });
+  const storeAssort = assortRows(sales, storeStock, dataNow, CFG.ASSORT_WINDOW_DAYS, CFG.ASSORT_KEEP_ST);
+  const assortStores = [...new Set(storeAssort.map(r=>r.scode))].sort();
+  diag.nStoreInv = inv.filter(i=>i.ltype==='Stores'&&i.comp!=='Other').length;
+  diag.invLocs = [...new Set(inv.map(i=>i.loc))].slice(0,16);
+
   // store-level missing piece, per store+style (inventory carries no colour)
   const storeInv={};
   inv.forEach(i=>{ if(i.ltype!=='Stores'||i.comp==='Other')return;
@@ -642,6 +684,7 @@ function build(){
      storeUnits7,units7,rev7,byDay,dayKeys,today,yday,todayK:dayKeys[dayKeys.length-1],ydayK:dayKeys[dayKeys.length-2],
      channel:{online:onl,offline:off},
      salesRecs:sales, storeOnHand, hasStoreInv, diag,
+     storeStock, storeAssort, assortStores,
      totalInvUnits:inv.reduce((a,i)=>a+i.avail,0),
      salesRows:RAW.sales.length, invRows:RAW.inventory.length,
      locCount:Object.keys(storeUnits7).length};
@@ -650,13 +693,15 @@ function build(){
 /* ===================== RENDER ===================== */
 const TITLES={overview:['Replenishment','Overview'],alerts:['Demand Signal','Fast-Moving Size Alerts'],
   alloc:['Allocation Engine','Size-Wise Smart Allocation'],sets:['Set Integrity','Set Completion &amp; Matching'],
-  fast:['Velocity','Fast-Selling Style Reminders'],ai:['Intelligence','AI Insight Engine'],data:['System','Data &amp; Sync']};
+  fast:['Velocity','Fast-Selling Style Reminders'],assort:['Inventory Policy','Store Assortment &amp; Sell-Through'],
+  ai:['Intelligence','AI Insight Engine'],data:['System','Data &amp; Sync']};
 
 function badges(){
   const set=(id,n)=>{const e=document.getElementById(id);e.textContent=n;e.className='cnt'+(n>0?'':' muted');};
   set('nav-alerts', M.fastSize.filter(a=>!acked.has(a.key)).length);
   set('nav-sets', M.incompleteSets.length + M.dispatchSets.filter(d=>!acked.has(d.key)).length);
   set('nav-fast', M.fastStyles.filter(s=>s.flag).length);
+  set('nav-assort', (M.storeAssort||[]).filter(r=>r.verdict==='Pull').length);
 }
 
 function renderOverview(){
@@ -1065,6 +1110,75 @@ function askAI(){
   const q=(document.getElementById('ai-q').value||'').trim(); if(!q)return;
   document.getElementById('ai-ans').innerHTML=`<div style="font-size:13.5px;line-height:1.6;margin-top:12px;padding:12px 14px;background:var(--surface-2);border:1px solid var(--line);border-radius:10px">${answerLocal(q)}</div>`;
 }
+let assortOpts={store:'__ALL__', days:CFG.ASSORT_WINDOW_DAYS, keep:Math.round(CFG.ASSORT_KEEP_ST*100), show:'all'};
+function renderAssort(){
+  if(!M.assortStores || !M.assortStores.length){
+    const locs=(M.diag&&M.diag.invLocs)||[];
+    return `<p class="lead">This view ranks every style a store holds by <b>sell-through</b> so you keep the productive ones and pull the dead stock.</p>
+      <div class="card"><div class="card-b"><div class="empty">No store-level stock detected in the Inventory sheet yet.<br><br>
+      Inventory location codes found: ${locs.length?locs.map(l=>`<span class="store-tag">${l}</span>`).join(' '):'—'}.<br>
+      To activate this, the Inventory rows for store stock need a <b>LocCode</b> matching a store (JUH, LDH, HHD…) rather than the warehouse (AHM). Once present, this lights up automatically.</div></div></div>`;
+  }
+  const opts=['<option value="__ALL__">All stores</option>'].concat(M.assortStores.map(c=>{
+    const nm=(M.storeAssort.find(r=>r.scode===c)||{}).store||c;
+    return `<option value="${c}"${assortOpts.store===c?' selected':''}>${nm}</option>`;})).join('');
+  let h=`<p class="lead">Each style a store holds, ranked by <b>sell-through</b> = sold ÷ (sold + store stock) over the window. <b>Keep</b> = productive, <b>Reorder</b> = sold out but selling, <b>Watch</b> = soft, <b>Pull</b> = dead/overstocked → stop replenishing and redeploy.</p>`;
+  h+=`<div class="kpis" id="assort-kpis" style="margin-bottom:18px"></div>`;
+  h+=`<div class="card"><div class="tool">
+      <div class="fld"><label>Store</label><select id="as-store" style="min-width:180px">${opts}</select></div>
+      <div class="fld"><label>Window (days)</label><input type="number" id="as-days" value="${assortOpts.days}" min="7" max="365" style="min-width:90px"></div>
+      <div class="fld"><label>Keep at &#8805; sell-through %</label><input type="number" id="as-keep" value="${assortOpts.keep}" min="10" max="95" style="min-width:110px"></div>
+      <div class="fld"><label>Show</label><select id="as-show" style="min-width:150px">
+        <option value="all"${assortOpts.show==='all'?' selected':''}>All verdicts</option>
+        <option value="Pull"${assortOpts.show==='Pull'?' selected':''}>Pull list (dead/overstocked)</option>
+        <option value="Keep"${assortOpts.show==='Keep'?' selected':''}>Keep list (productive)</option>
+        <option value="Reorder"${assortOpts.show==='Reorder'?' selected':''}>Reorder (sold out, selling)</option>
+      </select></div>
+      <button class="btn primary" onclick="fillAssort()">↻ Update</button>
+      <div id="as-summary" style="margin-left:auto;align-self:center;font-size:12.5px;color:var(--ink-soft)"></div>
+    </div>
+    <table><thead><tr><th>Store</th><th>Style</th><th>Colour</th><th class="r">Sold</th><th class="r">Store stock</th>
+      <th class="r">Sell-thru</th><th class="r">Cover</th><th class="r">Stock value</th><th class="c">Verdict</th></tr></thead>
+      <tbody id="assort-rows"></tbody></table></div>`;
+  return h;
+}
+function fillAssort(){
+  const sEl=document.getElementById('as-store');
+  if(sEl) assortOpts={store:sEl.value, days:Math.max(7,parseInt(document.getElementById('as-days').value)||CFG.ASSORT_WINDOW_DAYS),
+    keep:Math.min(95,Math.max(10,parseInt(document.getElementById('as-keep').value)||60)), show:document.getElementById('as-show').value};
+  let rows=assortRows(M.salesRecs, M.storeStock, M.dataNow, assortOpts.days, assortOpts.keep/100);
+  if(assortOpts.store!=='__ALL__') rows=rows.filter(r=>r.scode===assortOpts.store);
+  // KPI summary (based on current store scope, before verdict filter)
+  const carried=rows.filter(r=>r.onhand>0);
+  const productive=carried.filter(r=>r.verdict==='Keep'||r.verdict==='Watch'&&r.sold>0).length;
+  const pull=rows.filter(r=>r.verdict==='Pull');
+  const deadUnits=pull.reduce((a,r)=>a+r.onhand,0), deadVal=pull.reduce((a,r)=>a+r.value,0);
+  const prodPct = carried.length? Math.round(carried.filter(r=>r.verdict==='Keep'||r.verdict==='Reorder').length/carried.length*100):0;
+  const kp=document.getElementById('assort-kpis');
+  if(kp) kp.innerHTML=[
+    ['Style-colours carried', carried.length, 'with store stock'],
+    ['Productive', prodPct+'%', 'keep / reordering'],
+    ['Dead-stock units', deadUnits.toLocaleString('en-IN'), pull.length+' lines to pull'],
+    ['Dead-stock value', fmtN(deadVal), 'tied up — redeploy'],
+  ].map(k=>`<div class="kpi"><div class="k">${k[0]}</div><div class="v num">${k[1]}</div><div class="d">${k[2]}</div></div>`).join('');
+  // table
+  const order={Pull:0,Reorder:1,Keep:2,Watch:3};
+  let view=rows.slice().sort((a,b)=>(order[a.verdict]-order[b.verdict])||(b.onhand-a.onhand));
+  if(assortOpts.show!=='all') view=view.filter(r=>r.verdict===assortOpts.show);
+  const shown=view.slice(0,400);
+  const pill={hi:'med',ok:'ok',dead:'hi',watch:'flat'};   // Reorder→marigold, Keep→teal, Pull→terracotta, Watch→grey
+  const tb=document.getElementById('assort-rows'); if(!tb) return;
+  tb.innerHTML = shown.length? shown.map(r=>`<tr>
+    <td>${r.store}</td><td class="style-name">${r.model}</td><td>${colorChip(r.color)}</td>
+    <td class="r qty">${r.sold}</td><td class="r qty">${r.onhand}</td>
+    <td class="r qty">${(r.sellThru*100).toFixed(0)}%</td>
+    <td class="r qty">${r.coverWk>=99?'&#8734;':r.coverWk.toFixed(1)+'w'}</td>
+    <td class="r qty">${r.value?fmtN(r.value):'—'}</td>
+    <td class="c"><span class="pill ${pill[r.tone]||'flat'}">${r.verdict}</span></td></tr>`).join('')
+    : `<tr><td colspan="9" class="empty">Nothing matches this filter for the chosen store/window.</td></tr>`;
+  const sm=document.getElementById('as-summary');
+  if(sm) sm.innerHTML=`<b>${view.length}</b> lines · <b style="color:var(--terracotta)">${pull.length}</b> to pull · <b style="color:var(--teal)">${rows.filter(r=>r.verdict==='Keep').length}</b> keep`;
+}
 function renderAI(){
   let h=`<p class="lead">An <b>offline answer engine</b> that reads your live metrics and replies instantly — daily briefing and free-text Q&amp;A, no internet round-trip, works the same for everyone on the team. If the page happens to be open inside Claude.ai, it quietly adds a richer Claude write-up on top.</p>`;
   // daily snapshot KPIs
@@ -1147,7 +1261,7 @@ function renderData(){
 }
 
 /* ===================== ROUTER + ACTIONS ===================== */
-const RENDER={overview:renderOverview,alerts:renderAlerts,alloc:renderAlloc,sets:renderSets,fast:renderFast,ai:renderAI,data:renderData};
+const RENDER={overview:renderOverview,alerts:renderAlerts,alloc:renderAlloc,sets:renderSets,fast:renderFast,assort:renderAssort,ai:renderAI,data:renderData};
 let current='overview';
 function go(v){
   current=v;
@@ -1157,6 +1271,7 @@ function go(v){
   document.getElementById('view').innerHTML=RENDER[v]();
   if(v==='alloc') computeAlloc();
   if(v==='alerts') fillAlerts();
+  if(v==='assort') fillAssort();
   if(v==='data') mountFallback();
   window.scrollTo(0,0);
 }
