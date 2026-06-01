@@ -802,13 +802,21 @@ function renderOverview(){
   return h;
 }
 
-let alertOpts={days:CFG.FAST_WINDOW_DAYS, minU:CFG.SIZE_ALERT_MIN_UNITS, scope:'small', onlyFlag:false};
+let alertOpts={days:CFG.FAST_WINDOW_DAYS, minU:CFG.SIZE_ALERT_MIN_UNITS, scope:'small', onlyFlag:false, store:'__ALL__', comp:'__ALL__'};
 function renderAlerts(){
+  const stMap={}; const comps=new Set();
+  (M.salesRecs||[]).forEach(s=>{ if(s.stype==='Stores'&&s.comp!=='Other'){ stMap[s.scode]=s.store; comps.add(s.comp); } });
+  const sopts=['<option value="__ALL__">All stores</option>'].concat(Object.keys(stMap).sort((a,b)=>stMap[a].localeCompare(stMap[b]))
+    .map(c=>`<option value="${c}"${alertOpts.store===c?' selected':''}>${stMap[c]}</option>`)).join('');
+  const hopts=['<option value="__ALL__">All types</option>'].concat([...comps].sort()
+    .map(c=>`<option value="${c}"${alertOpts.comp===c?' selected':''}>${c}</option>`)).join('');
   let h=`<p class="lead"><b>What this shows:</b> every size line that sold at a store in the chosen window, ranked by units. Lines hitting the <b>flag threshold</b> (or at zero store stock) are marked for replenishment. Widen the window or scope to see the full picture; tighten the threshold to focus on the urgent few.</p>`;
   h+=`<div class="card"><div class="tool">
+      <div class="fld"><label>Store</label><select id="al-store" style="min-width:160px">${sopts}</select></div>
+      <div class="fld"><label>Hierarchy</label><select id="al-comp" style="min-width:120px">${hopts}</select></div>
       <div class="fld"><label>Window (days)</label><input type="number" id="al-days" value="${alertOpts.days}" min="1" max="120" style="min-width:90px"></div>
       <div class="fld"><label>Flag at &#8805; units</label><input type="number" id="al-min" value="${alertOpts.minU}" min="1" max="50" style="min-width:90px"></div>
-      <div class="fld"><label>Sizes</label><select id="al-scope" style="min-width:160px"><option value="small"${alertOpts.scope==='small'?' selected':''}>Small only (${CFG.SMALL_SIZES.join('/')})</option><option value="all"${alertOpts.scope==='all'?' selected':''}>All sizes</option></select></div>
+      <div class="fld"><label>Sizes</label><select id="al-scope" style="min-width:150px"><option value="small"${alertOpts.scope==='small'?' selected':''}>Small only (${CFG.SMALL_SIZES.join('/')})</option><option value="all"${alertOpts.scope==='all'?' selected':''}>All sizes</option></select></div>
       <div class="fld"><label>&nbsp;</label><label style="font-weight:500;font-size:13px;display:flex;align-items:center;gap:7px;cursor:pointer;padding:8px 0"><input type="checkbox" id="al-flag"${alertOpts.onlyFlag?' checked':''}> Only flagged</label></div>
       <button class="btn primary" onclick="fillAlerts()">↻ Update</button>
       <div id="al-summary" style="margin-left:auto;align-self:center;font-size:12.5px;color:var(--ink-soft)"></div>
@@ -823,9 +831,13 @@ function fillAlerts(){
   if(dEl) alertOpts={days:Math.max(1,parseInt(dEl.value)||CFG.FAST_WINDOW_DAYS),
                      minU:Math.max(1,parseInt(document.getElementById('al-min').value)||CFG.SIZE_ALERT_MIN_UNITS),
                      scope:document.getElementById('al-scope').value,
-                     onlyFlag:document.getElementById('al-flag').checked};
+                     onlyFlag:document.getElementById('al-flag').checked,
+                     store:document.getElementById('al-store').value,
+                     comp:document.getElementById('al-comp').value};
   let rows=aggFast(M.salesRecs, M.storeOnHand, M.dataNow, alertOpts.days, alertOpts.minU, alertOpts.scope, M.hasStoreInv)
             .filter(a=>!acked.has(a.key));
+  if(alertOpts.store!=='__ALL__') rows=rows.filter(r=>r.scode===alertOpts.store);
+  if(alertOpts.comp!=='__ALL__') rows=rows.filter(r=>r.comp===alertOpts.comp);
   const total=rows.length, flagged=rows.filter(r=>r.flagged).length;
   if(alertOpts.onlyFlag) rows=rows.filter(r=>r.flagged);
   const shown=rows.slice(0,300);
