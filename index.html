@@ -1158,7 +1158,7 @@ function askAI(){
   const q=(document.getElementById('ai-q').value||'').trim(); if(!q)return;
   document.getElementById('ai-ans').innerHTML=`<div style="font-size:13.5px;line-height:1.6;margin-top:12px;padding:12px 14px;background:var(--surface-2);border:1px solid var(--line);border-radius:10px">${answerLocal(q)}</div>`;
 }
-let assortOpts={store:'__ALL__', days:CFG.ASSORT_WINDOW_DAYS, keep:Math.round(CFG.ASSORT_KEEP_ST*100), show:'all'};
+let assortOpts={store:'__ALL__', hier:'__ALL__', days:CFG.ASSORT_WINDOW_DAYS, keep:Math.round(CFG.ASSORT_KEEP_ST*100), show:'all'};
 function renderAssort(){
   if(!M.assortStores || !M.assortStores.length){
     const locs=(M.diag&&M.diag.invLocs)||[];
@@ -1170,10 +1170,14 @@ function renderAssort(){
   const opts=['<option value="__ALL__">All stores</option>'].concat(M.assortStores.map(c=>{
     const nm=(M.storeAssort.find(r=>r.scode===c)||{}).store||c;
     return `<option value="${c}"${assortOpts.store===c?' selected':''}>${nm}</option>`;})).join('');
+  const hiers=[...new Set(M.storeAssort.map(r=>r.hier).filter(Boolean))].sort();
+  const hopts=['<option value="__ALL__">All types</option>'].concat(hiers.map(hi=>
+    `<option value="${hi}"${assortOpts.hier===hi?' selected':''}>${hi}</option>`)).join('');
   let h=`<p class="lead">Each style a store holds, ranked by <b>sell-through</b> = sold ÷ (sold + store stock) over the window. <b>Keep</b> = productive, <b>Reorder</b> = sold out but selling, <b>Watch</b> = soft, <b>Pull</b> = dead/overstocked → stop replenishing and redeploy.</p>`;
   h+=`<div class="kpis" id="assort-kpis" style="margin-bottom:18px"></div>`;
   h+=`<div class="card"><div class="tool">
       <div class="fld"><label>Store</label><select id="as-store" style="min-width:180px">${opts}</select></div>
+      <div class="fld"><label>Hierarchy</label><select id="as-hier" style="min-width:130px">${hopts}</select></div>
       <div class="fld"><label>Window (days)</label><input type="number" id="as-days" value="${assortOpts.days}" min="7" max="365" style="min-width:90px"></div>
       <div class="fld"><label>Keep at &#8805; sell-through %</label><input type="number" id="as-keep" value="${assortOpts.keep}" min="10" max="95" style="min-width:110px"></div>
       <div class="fld"><label>Show</label><select id="as-show" style="min-width:150px">
@@ -1192,10 +1196,12 @@ function renderAssort(){
 }
 function fillAssort(){
   const sEl=document.getElementById('as-store');
-  if(sEl) assortOpts={store:sEl.value, days:Math.max(7,parseInt(document.getElementById('as-days').value)||CFG.ASSORT_WINDOW_DAYS),
+  if(sEl) assortOpts={store:sEl.value, hier:document.getElementById('as-hier').value,
+    days:Math.max(7,parseInt(document.getElementById('as-days').value)||CFG.ASSORT_WINDOW_DAYS),
     keep:Math.min(95,Math.max(10,parseInt(document.getElementById('as-keep').value)||60)), show:document.getElementById('as-show').value};
   let rows=assortRows(M.salesRecs, M.storeStock, M.dataNow, assortOpts.days, assortOpts.keep/100, M.modelHier);
   if(assortOpts.store!=='__ALL__') rows=rows.filter(r=>r.scode===assortOpts.store);
+  if(assortOpts.hier!=='__ALL__') rows=rows.filter(r=>r.hier===assortOpts.hier);
   // KPI summary (based on current store scope, before verdict filter)
   const carried=rows.filter(r=>r.onhand>0);
   const productive=carried.filter(r=>r.verdict==='Keep'||r.verdict==='Watch'&&r.sold>0).length;
