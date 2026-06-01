@@ -457,11 +457,13 @@ function assortVerdict(sold, onhand, sellThru, coverWk, keepThr){
   if(sellThru<0.25 && coverWk>12)    return {v:'Pull', t:'dead'};          // overstocked slow mover
   return {v:'Watch', t:'watch'};
 }
-function assortRows(salesRecs, stockMap, dataNow, days, keepThr){
+function assortRows(salesRecs, stockMap, dataNow, days, keepThr, hierMap){
   const since=new Date(dataNow.getTime()-days*86400000);
   const sold={};
   salesRecs.forEach(s=>{ if(s.stype!=='Stores'||!s.date||s.date<since||s.comp==='Other')return;
     const k=s.scode+'|'+s.model+'|'+(s.color||''); sold[k]=(sold[k]||0)+s.qty; });
+  const pick=o=>o&&Object.keys(o).sort((a,b)=>o[b]-o[a])[0];
+  const hierOf=(model,color)=> hierMap ? (pick(hierMap[model+'|'+(color||'')])||pick(hierMap[model])||'') : '';
   const keys=new Set([...Object.keys(sold),...Object.keys(stockMap)]);
   const rows=[];
   keys.forEach(k=>{
@@ -472,7 +474,7 @@ function assortRows(salesRecs, stockMap, dataNow, days, keepThr){
     const sellThru=(u+onhand)>0 ? u/(u+onhand) : 0;
     const wkRate=u/(days/7), coverWk = wkRate>0 ? onhand/wkRate : (onhand>0?99:0);
     const vd=assortVerdict(u,onhand,sellThru,coverWk,keepThr);
-    rows.push({scode, store:st.store||scode, model, color, sold:u, onhand, sellThru, coverWk,
+    rows.push({scode, store:st.store||scode, model, color, hier:hierOf(model,color), sold:u, onhand, sellThru, coverWk,
                value:Math.round(onhand*(st.mrp||0)), verdict:vd.v, tone:vd.t});
   });
   return rows.sort((a,b)=> b.onhand-a.onhand);
@@ -547,7 +549,7 @@ function build(){
     const comp=compOf(col(r,'Hierarchy Code'), col(r,'SKU Desc'), col(r,'Collection'));
     const sku=col(r,'SKU');
     inv.push({
-      model:modelOf(col(r,'SKU Desc')), desc:col(r,'SKU Desc'), sku,
+      model:modelOf(col(r,'SKU Desc')), desc:col(r,'SKU Desc'), sku, hier:col(r,'Hierarchy Code').trim(),
       comp, size:nsize(col(r,'Size')), color:normColor(col(r,'Colour','Color'))||colorOf(sku,''),
       avail:numv(col(r,'Available Qty')), total:numv(col(r,'Total Qty')),
       committed:numv(col(r,'Committed Qty')), transit:numv(col(r,'InTransit Qty')),
@@ -665,12 +667,16 @@ function build(){
   diag.pairMatched=pairMatched; diag.pairSkuTotal=pairSkuTotal;
 
   /* store-assortment: store stock (per store×style×colour) + sell-through */
+  const modelHier={};
+  inv.forEach(i=>{ if(!i.hier) return;
+    [i.model+'|'+(i.color||''), i.model].forEach(k=>{ const m=modelHier[k]||(modelHier[k]={});
+      m[i.hier]=(m[i.hier]||0)+(i.avail||1); }); });
   const storeStock={};
   inv.forEach(i=>{ if(i.ltype!=='Stores'||i.comp==='Other')return;
     const k=i.loc+'|'+i.model+'|'+(i.color||'');
     const e=storeStock[k]||(storeStock[k]={onhand:0,mrp:i.mrp,store:shortName(STOREMAP[i.loc]?.name||i.loc)});
     e.onhand+=i.avail; });
-  const storeAssort = assortRows(sales, storeStock, dataNow, CFG.ASSORT_WINDOW_DAYS, CFG.ASSORT_KEEP_ST);
+  const storeAssort = assortRows(sales, storeStock, dataNow, CFG.ASSORT_WINDOW_DAYS, CFG.ASSORT_KEEP_ST, modelHier);
   const assortStores = [...new Set(storeAssort.map(r=>r.scode))].sort();
   const rebalance = rebalancePlan(storeAssort, CFG.ASSORT_WINDOW_DAYS, CFG.REBALANCE_MIN_QTY);
   diag.nStoreInv = inv.filter(i=>i.ltype==='Stores'&&i.comp!=='Other').length;
@@ -724,7 +730,7 @@ function build(){
      storeUnits7,units7,rev7,byDay,dayKeys,today,yday,todayK:dayKeys[dayKeys.length-1],ydayK:dayKeys[dayKeys.length-2],
      channel:{online:onl,offline:off},
      salesRecs:sales, storeOnHand, hasStoreInv, diag,
-     storeStock, storeAssort, assortStores, rebalance,
+     storeStock, storeAssort, assortStores, rebalance, modelHier,
      totalInvUnits:inv.reduce((a,i)=>a+i.avail,0),
      salesRows:RAW.sales.length, invRows:RAW.inventory.length,
      locCount:Object.keys(storeUnits7).length};
@@ -1179,7 +1185,7 @@ function renderAssort(){
       <button class="btn primary" onclick="fillAssort()">↻ Update</button>
       <div id="as-summary" style="margin-left:auto;align-self:center;font-size:12.5px;color:var(--ink-soft)"></div>
     </div>
-    <table><thead><tr><th>Store</th><th>Style</th><th>Colour</th><th class="r">Sold</th><th class="r">Store stock</th>
+    <table><thead><tr><th>Store</th><th>Style</th><th>Hierarchy</th><th>Colour</th><th class="r">Sold</th><th class="r">Store stock</th>
       <th class="r">Sell-thru</th><th class="r">Cover</th><th class="r">Stock value</th><th class="c">Verdict</th></tr></thead>
       <tbody id="assort-rows"></tbody></table></div>`;
   return h;
@@ -1188,7 +1194,7 @@ function fillAssort(){
   const sEl=document.getElementById('as-store');
   if(sEl) assortOpts={store:sEl.value, days:Math.max(7,parseInt(document.getElementById('as-days').value)||CFG.ASSORT_WINDOW_DAYS),
     keep:Math.min(95,Math.max(10,parseInt(document.getElementById('as-keep').value)||60)), show:document.getElementById('as-show').value};
-  let rows=assortRows(M.salesRecs, M.storeStock, M.dataNow, assortOpts.days, assortOpts.keep/100);
+  let rows=assortRows(M.salesRecs, M.storeStock, M.dataNow, assortOpts.days, assortOpts.keep/100, M.modelHier);
   if(assortOpts.store!=='__ALL__') rows=rows.filter(r=>r.scode===assortOpts.store);
   // KPI summary (based on current store scope, before verdict filter)
   const carried=rows.filter(r=>r.onhand>0);
@@ -1211,13 +1217,14 @@ function fillAssort(){
   const pill={hi:'med',ok:'ok',dead:'hi',watch:'flat'};   // Reorder→marigold, Keep→teal, Pull→terracotta, Watch→grey
   const tb=document.getElementById('assort-rows'); if(!tb) return;
   tb.innerHTML = shown.length? shown.map(r=>`<tr>
-    <td>${r.store}</td><td class="style-name">${r.model}</td><td>${colorChip(r.color)}</td>
+    <td>${r.store}</td><td class="style-name">${r.model}</td>
+    <td><span class="store-tag">${r.hier||'—'}</span></td><td>${colorChip(r.color)}</td>
     <td class="r qty">${r.sold}</td><td class="r qty">${r.onhand}</td>
     <td class="r qty">${(r.sellThru*100).toFixed(0)}%</td>
     <td class="r qty">${r.coverWk>=99?'&#8734;':r.coverWk.toFixed(1)+'w'}</td>
     <td class="r qty">${r.value?fmtN(r.value):'—'}</td>
     <td class="c"><span class="pill ${pill[r.tone]||'flat'}">${r.verdict}</span></td></tr>`).join('')
-    : `<tr><td colspan="9" class="empty">Nothing matches this filter for the chosen store/window.</td></tr>`;
+    : `<tr><td colspan="10" class="empty">Nothing matches this filter for the chosen store/window.</td></tr>`;
   const sm=document.getElementById('as-summary');
   if(sm) sm.innerHTML=`<b>${view.length}</b> lines · <b style="color:var(--terracotta)">${pull.length}</b> to pull · <b style="color:var(--teal)">${rows.filter(r=>r.verdict==='Keep').length}</b> keep`;
 }
@@ -1247,7 +1254,7 @@ function fillRebalance(){
   const dEl=document.getElementById('rb-days');
   if(dEl) rebalOpts={days:Math.max(7,parseInt(dEl.value)||CFG.ASSORT_WINDOW_DAYS),
                      minQty:Math.max(1,parseInt(document.getElementById('rb-min').value)||CFG.REBALANCE_MIN_QTY)};
-  const rows=assortRows(M.salesRecs, M.storeStock, M.dataNow, rebalOpts.days, CFG.ASSORT_KEEP_ST);
+  const rows=assortRows(M.salesRecs, M.storeStock, M.dataNow, rebalOpts.days, CFG.ASSORT_KEEP_ST, M.modelHier);
   const {transfers,recalls}=rebalancePlan(rows, rebalOpts.days, rebalOpts.minQty);
   const moveUnits=transfers.reduce((a,t)=>a+t.qty,0), moveVal=transfers.reduce((a,t)=>a+t.value,0);
   const recallUnits=recalls.reduce((a,r)=>a+r.units,0), recallVal=recalls.reduce((a,r)=>a+r.value,0);
