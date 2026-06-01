@@ -176,6 +176,7 @@
     <div class="nav-item" data-view="sets"><span class="ico">❖</span> Set Completion <span class="cnt muted" id="nav-sets">0</span></div>
     <div class="nav-item" data-view="fast"><span class="ico">↗</span> Fast-Sellers <span class="cnt muted" id="nav-fast">0</span></div>
     <div class="nav-item" data-view="assort"><span class="ico">▦</span> Store Assortment <span class="cnt muted" id="nav-assort">0</span></div>
+    <div class="nav-item" data-view="rebal"><span class="ico">⇄</span> Stock Rebalance <span class="cnt muted" id="nav-rebal">0</span></div>
     <div class="nav-item" data-view="ai"><span class="ico">✦</span> AI Insights</div>
     <div class="nav-label">System</div>
     <div class="nav-item" data-view="data"><span class="ico">⎙</span> Data &amp; Sync</div>
@@ -228,6 +229,9 @@ const CFG = {
   REORDER_COVER_WK: 2.0,                // Feature 4 weeks-of-cover trigger
   ASSORT_WINDOW_DAYS: 30,               // Store-assortment sell-through lookback
   ASSORT_KEEP_ST: 0.60,                 // sell-through at/above which a style is "productive" at a store
+  REBALANCE_COVER_WK: 3,                // target weeks of cover to top a receiver store up to
+  REBALANCE_DONOR_KEEP_WK: 2,           // weeks of cover a slow donor keeps before surplus is moved
+  REBALANCE_MIN_QTY: 2,                 // smallest worthwhile transfer
 };
 const SIZE_ORDER = ['XS','S','M','L','XL','XXL'];
 const csvUrl = gid => `https://docs.google.com/spreadsheets/d/${CFG.SHEET_ID}/gviz/tq?tqx=out:csv&gid=${gid}`;
@@ -410,6 +414,41 @@ async function loadAll(){
 }
 
 /* ===================== TRANSFORM + COMPUTE ===================== */
+/* inter-store rebalance: move dead stock from donor stores to stores selling it; recall the rest to WH. Pure. */
+function rebalancePlan(rows, days, minQty){
+  minQty=minQty||CFG.REBALANCE_MIN_QTY;
+  const wk=days/7, targetWk=CFG.REBALANCE_COVER_WK, keepWk=CFG.REBALANCE_DONOR_KEEP_WK;
+  const groups={}; rows.forEach(r=>{ const k=r.model+'|'+(r.color||''); (groups[k]=groups[k]||[]).push(r); });
+  const transfers=[], recalls=[];
+  Object.values(groups).forEach(g=>{
+    const unit=r=>r.onhand? r.value/r.onhand : 0;
+    const donors=g.filter(r=>r.verdict==='Pull'&&r.onhand>0).map(r=>{
+      const rate=r.sold/wk; return {...r, surplus:Math.max(0, r.onhand-Math.ceil(rate*keepWk))};
+    }).filter(d=>d.surplus>0).sort((a,b)=>b.surplus-a.surplus);
+    if(!donors.length) return;
+    const receivers=g.filter(r=>r.verdict==='Reorder'||(r.verdict==='Keep'&&r.coverWk<targetWk)).map(r=>{
+      const rate=r.sold/wk; return {...r, need:Math.max(0, Math.ceil(rate*targetWk)-r.onhand)};
+    }).filter(x=>x.need>0).sort((a,b)=> b.sellThru-a.sellThru || b.need-a.need);
+    let ri=0;
+    donors.forEach(d=>{
+      let avail=d.surplus;
+      while(avail>=minQty && ri<receivers.length){
+        const rcv=receivers[ri];
+        if(rcv.need<minQty){ ri++; continue; }
+        const q=Math.min(avail, rcv.need);
+        transfers.push({model:d.model,color:d.color, from:d.store,fromCode:d.scode,fromST:d.sellThru,fromStock:d.onhand,
+          to:rcv.store,toCode:rcv.scode,toST:rcv.sellThru,toCover:rcv.coverWk,toVerdict:rcv.verdict,
+          qty:q, value:Math.round(q*unit(d))});
+        avail-=q; rcv.need-=q; if(rcv.need<=0) ri++;
+      }
+      if(avail>=minQty) recalls.push({model:d.model,color:d.color,store:d.store,scode:d.scode,
+        units:avail, sellThru:d.sellThru, value:Math.round(avail*unit(d)), buyer:receivers.length>0});
+    });
+  });
+  transfers.sort((a,b)=> b.qty-a.qty);
+  recalls.sort((a,b)=> b.units-a.units);
+  return {transfers, recalls};
+}
 /* store-assortment sell-through: per store × style × colour. Pure. */
 function assortVerdict(sold, onhand, sellThru, coverWk, keepThr){
   if(onhand===0 && sold>0)  return {v:'Reorder', t:'hi'};                  // sold out at store but was selling
@@ -633,6 +672,7 @@ function build(){
     e.onhand+=i.avail; });
   const storeAssort = assortRows(sales, storeStock, dataNow, CFG.ASSORT_WINDOW_DAYS, CFG.ASSORT_KEEP_ST);
   const assortStores = [...new Set(storeAssort.map(r=>r.scode))].sort();
+  const rebalance = rebalancePlan(storeAssort, CFG.ASSORT_WINDOW_DAYS, CFG.REBALANCE_MIN_QTY);
   diag.nStoreInv = inv.filter(i=>i.ltype==='Stores'&&i.comp!=='Other').length;
   diag.invLocs = [...new Set(inv.map(i=>i.loc))].slice(0,16);
 
@@ -684,7 +724,7 @@ function build(){
      storeUnits7,units7,rev7,byDay,dayKeys,today,yday,todayK:dayKeys[dayKeys.length-1],ydayK:dayKeys[dayKeys.length-2],
      channel:{online:onl,offline:off},
      salesRecs:sales, storeOnHand, hasStoreInv, diag,
-     storeStock, storeAssort, assortStores,
+     storeStock, storeAssort, assortStores, rebalance,
      totalInvUnits:inv.reduce((a,i)=>a+i.avail,0),
      salesRows:RAW.sales.length, invRows:RAW.inventory.length,
      locCount:Object.keys(storeUnits7).length};
@@ -694,6 +734,7 @@ function build(){
 const TITLES={overview:['Replenishment','Overview'],alerts:['Demand Signal','Fast-Moving Size Alerts'],
   alloc:['Allocation Engine','Size-Wise Smart Allocation'],sets:['Set Integrity','Set Completion &amp; Matching'],
   fast:['Velocity','Fast-Selling Style Reminders'],assort:['Inventory Policy','Store Assortment &amp; Sell-Through'],
+  rebal:['Inventory Policy','Stock Rebalance &amp; Transfers'],
   ai:['Intelligence','AI Insight Engine'],data:['System','Data &amp; Sync']};
 
 function badges(){
@@ -702,6 +743,7 @@ function badges(){
   set('nav-sets', M.incompleteSets.length + M.dispatchSets.filter(d=>!acked.has(d.key)).length);
   set('nav-fast', M.fastStyles.filter(s=>s.flag).length);
   set('nav-assort', (M.storeAssort||[]).filter(r=>r.verdict==='Pull').length);
+  set('nav-rebal', (M.rebalance&&M.rebalance.transfers.length)||0);
 }
 
 function renderOverview(){
@@ -1179,6 +1221,60 @@ function fillAssort(){
   const sm=document.getElementById('as-summary');
   if(sm) sm.innerHTML=`<b>${view.length}</b> lines · <b style="color:var(--terracotta)">${pull.length}</b> to pull · <b style="color:var(--teal)">${rows.filter(r=>r.verdict==='Keep').length}</b> keep`;
 }
+let rebalOpts={days:CFG.ASSORT_WINDOW_DAYS, minQty:CFG.REBALANCE_MIN_QTY};
+function renderRebalance(){
+  if(!M.assortStores || !M.assortStores.length){
+    return `<p class="lead">This view moves dead stock from stores where a style isn't selling to stores where it is — and recalls the rest to the warehouse.</p>
+      <div class="card"><div class="card-b"><div class="empty">Needs store-level stock in the Inventory sheet (LocCode = store code). Once present, transfer suggestions appear here automatically.</div></div></div>`;
+  }
+  let h=`<p class="lead">For each style + colour, ARS finds stores where it's <b>dead/overstocked</b> and stores where it's <b>selling</b>, then suggests a transfer sized to the receiving store's demand. Styles selling <b>nowhere</b> are recalled to the warehouse. Transfers can move store-to-store directly or route via the warehouse.</p>`;
+  h+=`<div class="kpis" id="rebal-kpis" style="margin-bottom:18px"></div>`;
+  h+=`<div class="card"><div class="tool">
+      <div class="fld"><label>Window (days)</label><input type="number" id="rb-days" value="${rebalOpts.days}" min="7" max="365" style="min-width:90px"></div>
+      <div class="fld"><label>Min transfer qty</label><input type="number" id="rb-min" value="${rebalOpts.minQty}" min="1" max="50" style="min-width:100px"></div>
+      <button class="btn primary" onclick="fillRebalance()">↻ Update</button>
+      <div id="rb-summary" style="margin-left:auto;align-self:center;font-size:12.5px;color:var(--ink-soft)"></div>
+    </div>
+    <div class="card-h" style="border-top:1px solid var(--line)"><h3>⇄ Suggested store-to-store transfers</h3><div class="sub">move surplus to where it sells</div></div>
+    <table><thead><tr><th>Style</th><th>Colour</th><th>From (dead)</th><th>→ To (selling)</th><th class="r">Move qty</th><th class="r">Value</th><th class="r">Action</th></tr></thead>
+      <tbody id="rebal-rows"></tbody></table></div>`;
+  h+=`<div class="card" style="margin-top:18px"><div class="card-h"><h3>⎙ Recall to warehouse</h3><div class="sub">dead stock with no store selling it</div></div>
+    <table><thead><tr><th>Style</th><th>Colour</th><th>From store</th><th class="r">Units</th><th class="r">Value</th><th>Why</th></tr></thead>
+      <tbody id="recall-rows"></tbody></table></div>`;
+  return h;
+}
+function fillRebalance(){
+  const dEl=document.getElementById('rb-days');
+  if(dEl) rebalOpts={days:Math.max(7,parseInt(dEl.value)||CFG.ASSORT_WINDOW_DAYS),
+                     minQty:Math.max(1,parseInt(document.getElementById('rb-min').value)||CFG.REBALANCE_MIN_QTY)};
+  const rows=assortRows(M.salesRecs, M.storeStock, M.dataNow, rebalOpts.days, CFG.ASSORT_KEEP_ST);
+  const {transfers,recalls}=rebalancePlan(rows, rebalOpts.days, rebalOpts.minQty);
+  const moveUnits=transfers.reduce((a,t)=>a+t.qty,0), moveVal=transfers.reduce((a,t)=>a+t.value,0);
+  const recallUnits=recalls.reduce((a,r)=>a+r.units,0), recallVal=recalls.reduce((a,r)=>a+r.value,0);
+  const kp=document.getElementById('rebal-kpis');
+  if(kp) kp.innerHTML=[
+    ['Transfer suggestions', transfers.length, 'store → store'],
+    ['Units to move', moveUnits.toLocaleString('en-IN'), 'redeployed to demand'],
+    ['Value redeployed', fmtN(moveVal), 'dead → selling'],
+    ['Recall to WH', recalls.length+' lines', recallUnits.toLocaleString('en-IN')+' units · '+fmtN(recallVal)],
+  ].map(k=>`<div class="kpi"><div class="k">${k[0]}</div><div class="v num">${k[1]}</div><div class="d">${k[2]}</div></div>`).join('');
+  const tb=document.getElementById('rebal-rows');
+  if(tb) tb.innerHTML = transfers.length ? transfers.slice(0,300).map(t=>`<tr>
+      <td class="style-name">${t.model}</td><td>${colorChip(t.color)}</td>
+      <td>${t.from} <span style="color:var(--terracotta);font-size:11px">· ${(t.fromST*100).toFixed(0)}% ST, ${t.fromStock} on hand</span></td>
+      <td><b>${t.to}</b> <span style="color:var(--teal);font-size:11px">· ${t.toVerdict==='Reorder'?'sold out, selling':(t.toST*100).toFixed(0)+'% ST, '+t.toCover.toFixed(1)+'w cover'}</span></td>
+      <td class="r qty"><b>${t.qty}</b></td><td class="r qty">${t.value?fmtN(t.value):'—'}</td>
+      <td class="r"><button class="ack" onclick="ack('rb|${t.fromCode}${t.toCode}${t.model}${t.color}')">✓ Plan</button></td></tr>`).join('')
+    : `<tr><td colspan="7" class="empty">No transfer opportunities in this window — no style is dead in one store and selling in another.</td></tr>`;
+  const rc=document.getElementById('recall-rows');
+  if(rc) rc.innerHTML = recalls.length ? recalls.slice(0,300).map(r=>`<tr>
+      <td class="style-name">${r.model}</td><td>${colorChip(r.color)}</td><td>${r.store}</td>
+      <td class="r qty">${r.units}</td><td class="r qty">${r.value?fmtN(r.value):'—'}</td>
+      <td style="font-size:12px;color:var(--ink-soft)">${r.buyer?'leftover after transfers':'not selling at any store'}</td></tr>`).join('')
+    : `<tr><td colspan="6" class="empty">Nothing to recall — dead stock is being absorbed by transfers.</td></tr>`;
+  const sm=document.getElementById('rb-summary');
+  if(sm) sm.innerHTML=`<b style="color:var(--teal)">${transfers.length}</b> transfers · <b>${moveUnits}</b> units moved · <b style="color:var(--terracotta)">${recalls.length}</b> recall lines`;
+}
 function renderAI(){
   let h=`<p class="lead">An <b>offline answer engine</b> that reads your live metrics and replies instantly — daily briefing and free-text Q&amp;A, no internet round-trip, works the same for everyone on the team. If the page happens to be open inside Claude.ai, it quietly adds a richer Claude write-up on top.</p>`;
   // daily snapshot KPIs
@@ -1261,7 +1357,7 @@ function renderData(){
 }
 
 /* ===================== ROUTER + ACTIONS ===================== */
-const RENDER={overview:renderOverview,alerts:renderAlerts,alloc:renderAlloc,sets:renderSets,fast:renderFast,assort:renderAssort,ai:renderAI,data:renderData};
+const RENDER={overview:renderOverview,alerts:renderAlerts,alloc:renderAlloc,sets:renderSets,fast:renderFast,assort:renderAssort,rebal:renderRebalance,ai:renderAI,data:renderData};
 let current='overview';
 function go(v){
   current=v;
@@ -1272,6 +1368,7 @@ function go(v){
   if(v==='alloc') computeAlloc();
   if(v==='alerts') fillAlerts();
   if(v==='assort') fillAssort();
+  if(v==='rebal') fillRebalance();
   if(v==='data') mountFallback();
   window.scrollTo(0,0);
 }
