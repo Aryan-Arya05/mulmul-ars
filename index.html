@@ -436,12 +436,12 @@ function rebalancePlan(rows, days, minQty){
         const rcv=receivers[ri];
         if(rcv.need<minQty){ ri++; continue; }
         const q=Math.min(avail, rcv.need);
-        transfers.push({model:d.model,color:d.color, from:d.store,fromCode:d.scode,fromST:d.sellThru,fromStock:d.onhand,
+        transfers.push({model:d.model,color:d.color,hier:d.hier, from:d.store,fromCode:d.scode,fromST:d.sellThru,fromStock:d.onhand,
           to:rcv.store,toCode:rcv.scode,toST:rcv.sellThru,toCover:rcv.coverWk,toVerdict:rcv.verdict,
           qty:q, value:Math.round(q*unit(d))});
         avail-=q; rcv.need-=q; if(rcv.need<=0) ri++;
       }
-      if(avail>=minQty) recalls.push({model:d.model,color:d.color,store:d.store,scode:d.scode,
+      if(avail>=minQty) recalls.push({model:d.model,color:d.color,hier:d.hier,store:d.store,scode:d.scode,
         units:avail, sellThru:d.sellThru, value:Math.round(avail*unit(d)), buyer:receivers.length>0});
     });
   });
@@ -1234,34 +1234,62 @@ function fillAssort(){
   const sm=document.getElementById('as-summary');
   if(sm) sm.innerHTML=`<b>${view.length}</b> lines · <b style="color:var(--terracotta)">${pull.length}</b> to pull · <b style="color:var(--teal)">${rows.filter(r=>r.verdict==='Keep').length}</b> keep`;
 }
-let rebalOpts={days:CFG.ASSORT_WINDOW_DAYS, minQty:CFG.REBALANCE_MIN_QTY};
+let rebalOpts={store:'__ALL__', hier:'__ALL__', show:'all', days:CFG.ASSORT_WINDOW_DAYS, minQty:CFG.REBALANCE_MIN_QTY};
 function renderRebalance(){
   if(!M.assortStores || !M.assortStores.length){
     return `<p class="lead">This view moves dead stock from stores where a style isn't selling to stores where it is — and recalls the rest to the warehouse.</p>
       <div class="card"><div class="card-b"><div class="empty">Needs store-level stock in the Inventory sheet (LocCode = store code). Once present, transfer suggestions appear here automatically.</div></div></div>`;
   }
+  const sopts=['<option value="__ALL__">All stores</option>'].concat(M.assortStores.map(c=>{
+    const nm=(M.storeAssort.find(r=>r.scode===c)||{}).store||c;
+    return `<option value="${c}"${rebalOpts.store===c?' selected':''}>${nm}</option>`;})).join('');
+  const hiers=[...new Set(M.storeAssort.map(r=>r.hier).filter(Boolean))].sort();
+  const hopts=['<option value="__ALL__">All types</option>'].concat(hiers.map(hi=>
+    `<option value="${hi}"${rebalOpts.hier===hi?' selected':''}>${hi}</option>`)).join('');
+  const showSel=v=>rebalOpts.show===v?' selected':'';
   let h=`<p class="lead">For each style + colour, ARS finds stores where it's <b>dead/overstocked</b> and stores where it's <b>selling</b>, then suggests a transfer sized to the receiving store's demand. Styles selling <b>nowhere</b> are recalled to the warehouse. Transfers can move store-to-store directly or route via the warehouse.</p>`;
   h+=`<div class="kpis" id="rebal-kpis" style="margin-bottom:18px"></div>`;
   h+=`<div class="card"><div class="tool">
+      <div class="fld"><label>Store</label><select id="rb-store" style="min-width:170px">${sopts}</select></div>
+      <div class="fld"><label>Hierarchy</label><select id="rb-hier" style="min-width:130px">${hopts}</select></div>
+      <div class="fld"><label>Show</label><select id="rb-show" style="min-width:170px">
+        <option value="all"${showSel('all')}>Transfers + recalls</option>
+        <option value="reorder"${showSel('reorder')}>Transfers → sold-out stores</option>
+        <option value="keep"${showSel('keep')}>Transfers → low-cover stores</option>
+        <option value="recall"${showSel('recall')}>Recall to warehouse only</option>
+      </select></div>
       <div class="fld"><label>Window (days)</label><input type="number" id="rb-days" value="${rebalOpts.days}" min="7" max="365" style="min-width:90px"></div>
-      <div class="fld"><label>Min transfer qty</label><input type="number" id="rb-min" value="${rebalOpts.minQty}" min="1" max="50" style="min-width:100px"></div>
+      <div class="fld"><label>Min qty</label><input type="number" id="rb-min" value="${rebalOpts.minQty}" min="1" max="50" style="min-width:80px"></div>
       <button class="btn primary" onclick="fillRebalance()">↻ Update</button>
       <div id="rb-summary" style="margin-left:auto;align-self:center;font-size:12.5px;color:var(--ink-soft)"></div>
-    </div>
-    <div class="card-h" style="border-top:1px solid var(--line)"><h3>⇄ Suggested store-to-store transfers</h3><div class="sub">move surplus to where it sells</div></div>
-    <table><thead><tr><th>Style</th><th>Colour</th><th>From (dead)</th><th>→ To (selling)</th><th class="r">Move qty</th><th class="r">Value</th><th class="r">Action</th></tr></thead>
+    </div></div>`;
+  h+=`<div class="card" id="rb-transfers-card" style="margin-top:18px"><div class="card-h"><h3>⇄ Suggested store-to-store transfers</h3><div class="sub">move surplus to where it sells</div></div>
+    <table><thead><tr><th>Style</th><th>Hierarchy</th><th>Colour</th><th>From (dead)</th><th>→ To (selling)</th><th class="r">Move qty</th><th class="r">Value</th><th class="r">Action</th></tr></thead>
       <tbody id="rebal-rows"></tbody></table></div>`;
-  h+=`<div class="card" style="margin-top:18px"><div class="card-h"><h3>⎙ Recall to warehouse</h3><div class="sub">dead stock with no store selling it</div></div>
-    <table><thead><tr><th>Style</th><th>Colour</th><th>From store</th><th class="r">Units</th><th class="r">Value</th><th>Why</th></tr></thead>
+  h+=`<div class="card" id="rb-recall-card" style="margin-top:18px"><div class="card-h"><h3>⎙ Recall to warehouse</h3><div class="sub">dead stock with no store selling it</div></div>
+    <table><thead><tr><th>Style</th><th>Hierarchy</th><th>Colour</th><th>From store</th><th class="r">Units</th><th class="r">Value</th><th>Why</th></tr></thead>
       <tbody id="recall-rows"></tbody></table></div>`;
   return h;
 }
 function fillRebalance(){
   const dEl=document.getElementById('rb-days');
-  if(dEl) rebalOpts={days:Math.max(7,parseInt(dEl.value)||CFG.ASSORT_WINDOW_DAYS),
+  if(dEl) rebalOpts={store:document.getElementById('rb-store').value, hier:document.getElementById('rb-hier').value,
+                     show:document.getElementById('rb-show').value,
+                     days:Math.max(7,parseInt(dEl.value)||CFG.ASSORT_WINDOW_DAYS),
                      minQty:Math.max(1,parseInt(document.getElementById('rb-min').value)||CFG.REBALANCE_MIN_QTY)};
   const rows=assortRows(M.salesRecs, M.storeStock, M.dataNow, rebalOpts.days, CFG.ASSORT_KEEP_ST, M.modelHier);
-  const {transfers,recalls}=rebalancePlan(rows, rebalOpts.days, rebalOpts.minQty);
+  let {transfers,recalls}=rebalancePlan(rows, rebalOpts.days, rebalOpts.minQty);
+  // filters
+  const st=rebalOpts.store, hi=rebalOpts.hier;
+  if(hi!=='__ALL__'){ transfers=transfers.filter(t=>t.hier===hi); recalls=recalls.filter(r=>r.hier===hi); }
+  if(st!=='__ALL__'){ transfers=transfers.filter(t=>t.fromCode===st||t.toCode===st); recalls=recalls.filter(r=>r.scode===st); }
+  if(rebalOpts.show==='reorder') transfers=transfers.filter(t=>t.toVerdict==='Reorder');
+  if(rebalOpts.show==='keep')    transfers=transfers.filter(t=>t.toVerdict==='Keep');
+  const showT = rebalOpts.show!=='recall', showR = (rebalOpts.show==='all'||rebalOpts.show==='recall');
+  const tCard=document.getElementById('rb-transfers-card'), rCard=document.getElementById('rb-recall-card');
+  if(tCard) tCard.style.display = showT?'':'none';
+  if(rCard) rCard.style.display = showR?'':'none';
+  // KPIs from filtered sets
   const moveUnits=transfers.reduce((a,t)=>a+t.qty,0), moveVal=transfers.reduce((a,t)=>a+t.value,0);
   const recallUnits=recalls.reduce((a,r)=>a+r.units,0), recallVal=recalls.reduce((a,r)=>a+r.value,0);
   const kp=document.getElementById('rebal-kpis');
@@ -1273,18 +1301,18 @@ function fillRebalance(){
   ].map(k=>`<div class="kpi"><div class="k">${k[0]}</div><div class="v num">${k[1]}</div><div class="d">${k[2]}</div></div>`).join('');
   const tb=document.getElementById('rebal-rows');
   if(tb) tb.innerHTML = transfers.length ? transfers.slice(0,300).map(t=>`<tr>
-      <td class="style-name">${t.model}</td><td>${colorChip(t.color)}</td>
+      <td class="style-name">${t.model}</td><td><span class="store-tag">${t.hier||'—'}</span></td><td>${colorChip(t.color)}</td>
       <td>${t.from} <span style="color:var(--terracotta);font-size:11px">· ${(t.fromST*100).toFixed(0)}% ST, ${t.fromStock} on hand</span></td>
       <td><b>${t.to}</b> <span style="color:var(--teal);font-size:11px">· ${t.toVerdict==='Reorder'?'sold out, selling':(t.toST*100).toFixed(0)+'% ST, '+t.toCover.toFixed(1)+'w cover'}</span></td>
       <td class="r qty"><b>${t.qty}</b></td><td class="r qty">${t.value?fmtN(t.value):'—'}</td>
       <td class="r"><button class="ack" onclick="ack('rb|${t.fromCode}${t.toCode}${t.model}${t.color}')">✓ Plan</button></td></tr>`).join('')
-    : `<tr><td colspan="7" class="empty">No transfer opportunities in this window — no style is dead in one store and selling in another.</td></tr>`;
+    : `<tr><td colspan="8" class="empty">No transfer opportunities for this filter.</td></tr>`;
   const rc=document.getElementById('recall-rows');
   if(rc) rc.innerHTML = recalls.length ? recalls.slice(0,300).map(r=>`<tr>
-      <td class="style-name">${r.model}</td><td>${colorChip(r.color)}</td><td>${r.store}</td>
+      <td class="style-name">${r.model}</td><td><span class="store-tag">${r.hier||'—'}</span></td><td>${colorChip(r.color)}</td><td>${r.store}</td>
       <td class="r qty">${r.units}</td><td class="r qty">${r.value?fmtN(r.value):'—'}</td>
       <td style="font-size:12px;color:var(--ink-soft)">${r.buyer?'leftover after transfers':'not selling at any store'}</td></tr>`).join('')
-    : `<tr><td colspan="6" class="empty">Nothing to recall — dead stock is being absorbed by transfers.</td></tr>`;
+    : `<tr><td colspan="7" class="empty">Nothing to recall for this filter.</td></tr>`;
   const sm=document.getElementById('rb-summary');
   if(sm) sm.innerHTML=`<b style="color:var(--teal)">${transfers.length}</b> transfers · <b>${moveUnits}</b> units moved · <b style="color:var(--terracotta)">${recalls.length}</b> recall lines`;
 }
