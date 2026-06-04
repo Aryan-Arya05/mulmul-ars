@@ -177,6 +177,7 @@
     <div class="nav-item" data-view="fast"><span class="ico">↗</span> Fast-Sellers <span class="cnt muted" id="nav-fast">0</span></div>
     <div class="nav-item" data-view="assort"><span class="ico">▦</span> Store Assortment <span class="cnt muted" id="nav-assort">0</span></div>
     <div class="nav-item" data-view="rebal"><span class="ico">⇄</span> Stock Rebalance <span class="cnt muted" id="nav-rebal">0</span></div>
+    <div class="nav-item" data-view="pull"><span class="ico">⤺</span> Pull-Back <span class="cnt muted" id="nav-pull">0</span></div>
     <div class="nav-item" data-view="ai"><span class="ico">✦</span> AI Insights</div>
     <div class="nav-label">System</div>
     <div class="nav-item" data-view="data"><span class="ico">⎙</span> Data &amp; Sync</div>
@@ -232,6 +233,7 @@ const CFG = {
   REBALANCE_COVER_WK: 3,                // target weeks of cover to top a receiver store up to
   REBALANCE_DONOR_KEEP_WK: 2,           // weeks of cover a slow donor keeps before surplus is moved
   REBALANCE_MIN_QTY: 2,                 // smallest worthwhile transfer
+  PULLBACK_SELLTHRU: 0.30,              // pull back broken-set pieces selling below this
 };
 const SIZE_ORDER = ['XS','S','M','L','XL','XXL'];
 const csvUrl = gid => `https://docs.google.com/spreadsheets/d/${CFG.SHEET_ID}/gviz/tq?tqx=out:csv&gid=${gid}`;
@@ -544,7 +546,41 @@ function rebalancePlanSize(rows, days, minQty){
   recalls.sort((a,b)=> b.units-a.units);
   return {transfers, recalls};
 }
-/* aggregate small/all-size movement in a window; pure (no globals except CFG) */
+/* Pull-back: stores holding a BROKEN set (a paired component sold out) whose held pieces sell slowly.
+   Recommend recalling those pieces to WH so they can be reallocated. Pure. */
+function pullBackPlan(salesRecs, invRecs, setComps, modelHier, dataNow, days, maxST){
+  const since=new Date(dataNow.getTime()-days*86400000);
+  const stock={}, sold={};
+  (invRecs||[]).forEach(i=>{ if(i.ltype!=='Stores'||i.comp==='Other')return;
+    const k=i.loc+'|'+i.model+'|'+(i.color||'');
+    const e=stock[k]||(stock[k]={loc:i.loc,model:i.model,color:i.color||'',Kurta:0,Pant:0,Dupatta:0,mrp:{Kurta:0,Pant:0,Dupatta:0}});
+    e[i.comp]+=i.avail; if(i.mrp) e.mrp[i.comp]=i.mrp; });
+  (salesRecs||[]).forEach(s=>{ if(s.stype!=='Stores'||s.comp==='Other'||!s.date||s.date<since)return;
+    const k=s.scode+'|'+s.model+'|'+(s.color||'')+'|'+s.comp; sold[k]=(sold[k]||0)+s.qty; });
+  const pick=o=>o&&Object.keys(o).sort((a,b)=>o[b]-o[a])[0];
+  const hierOf=(m,c)=> modelHier ? (pick(modelHier[m+'|'+(c||'')])||pick(modelHier[m])||'') : '';
+  const rows=[];
+  Object.values(stock).forEach(e=>{
+    const rel=setComps[e.model+'|'+e.color] || setComps[e.model];
+    if(!rel || rel.size<2) return;                       // not a multi-piece set → can't be "broken"
+    const comps=[...rel];
+    const present=comps.filter(c=>e[c]>0), missing=comps.filter(c=>e[c]===0);
+    if(present.length===0 || missing.length===0) return; // nothing held, or set is complete here
+    let tSold=0,tOn=0,val=0; const detail=[];
+    present.forEach(c=>{
+      const u=sold[e.loc+'|'+e.model+'|'+e.color+'|'+c]||0;
+      tSold+=u; tOn+=e[c]; val+=e[c]*(e.mrp[c]||0);
+      detail.push({comp:c, onhand:e[c], sold:u, st:(u+e[c])>0?u/(u+e[c]):0});
+    });
+    const sellThru=(tSold+tOn)>0 ? tSold/(tSold+tOn) : 0;
+    if(sellThru > maxST) return;                          // still selling adequately → leave it
+    const store=shortName(STOREMAP[e.loc]?.name||e.loc);
+    rows.push({scode:e.loc, store, model:e.model, color:e.color, hier:hierOf(e.model,e.color),
+      present:detail, missing, pullUnits:tOn, value:Math.round(val), sellThru,
+      key:'pb|'+e.loc+e.model+e.color});
+  });
+  return rows.sort((a,b)=> b.value-a.value);
+}
 function aggFast(sales, onHandMap, dataNow, days, minU, scope, storeInvKnown){
   const since=new Date(dataNow.getTime()-days*86400000);
   const small = scope==='all' ? null : CFG.SMALL_SIZES;
@@ -736,6 +772,12 @@ function build(){
     const ap=a.pending.reduce((x,y)=>x+y.n,0),bp=b.pending.reduce((x,y)=>x+y.n,0); return bp-ap;
   });
   const incompleteSets=inwardSets.filter(s=>s.pending.length>0);
+  // which components each style's sets actually use (so pull-back only flags genuinely-broken sets)
+  const setComps={};
+  Object.values(setAgg).forEach(g=>{
+    const add=(key)=>{ const s=setComps[key]||(setComps[key]=new Set()); g.present.forEach(c=>s.add(c)); };
+    add(g.label+'|'+(g.colour||'')); add(g.label);
+  });
   diag.tabPairing=(RAW.pairing||[]).length; diag.pairDefs=pairDefs;
   diag.pairMatched=pairMatched; diag.pairSkuTotal=pairSkuTotal;
 
@@ -802,7 +844,7 @@ function build(){
   M={dataNow,physStores,storeProfiles,fastSize,fastStyles,inwardSets,incompleteSets,dispatchSets,
      storeUnits7,units7,rev7,byDay,dayKeys,today,yday,todayK:dayKeys[dayKeys.length-1],ydayK:dayKeys[dayKeys.length-2],
      channel:{online:onl,offline:off},
-     salesRecs:sales, storeOnHand, hasStoreInv, diag, invRecs:inv,
+     salesRecs:sales, storeOnHand, hasStoreInv, diag, invRecs:inv, setComps,
      storeStock, storeAssort, assortStores, rebalance, modelHier,
      totalInvUnits:inv.reduce((a,i)=>a+i.avail,0),
      salesRows:RAW.sales.length, invRows:RAW.inventory.length,
@@ -814,6 +856,7 @@ const TITLES={overview:['Replenishment','Overview'],alerts:['Demand Signal','Fas
   alloc:['Allocation Engine','Size-Wise Smart Allocation'],sets:['Set Integrity','Set Completion &amp; Matching'],
   fast:['Velocity','Fast-Selling Style Reminders'],assort:['Inventory Policy','Store Assortment &amp; Sell-Through'],
   rebal:['Inventory Policy','Stock Rebalance &amp; Transfers'],
+  pull:['Inventory Policy','Pull-Back — Recover Broken-Set Stock'],
   ai:['Intelligence','AI Insight Engine'],data:['System','Data &amp; Sync']};
 
 function badges(){
@@ -823,6 +866,7 @@ function badges(){
   set('nav-fast', M.fastStyles.filter(s=>s.flag).length);
   set('nav-assort', (M.storeAssort||[]).filter(r=>r.verdict==='Pull').length);
   set('nav-rebal', (M.rebalance&&M.rebalance.transfers.length)||0);
+  set('nav-pull', (M.invRecs&&M.setComps)? pullBackPlan(M.salesRecs,M.invRecs,M.setComps,M.modelHier,M.dataNow,CFG.ASSORT_WINDOW_DAYS,CFG.PULLBACK_SELLTHRU).length : 0);
 }
 
 function renderOverview(){
@@ -1485,6 +1529,63 @@ function fillRebalance(){
   const sm=document.getElementById('rb-summary');
   if(sm) sm.innerHTML=`<b style="color:var(--teal)">${transfers.length}</b> size transfers · <b>${moveUnits}</b> units moved · <b style="color:var(--terracotta)">${recalls.length}</b> recall lines`;
 }
+let pullOpts={store:'__ALL__', hier:'__ALL__', maxST:Math.round(CFG.PULLBACK_SELLTHRU*100), days:CFG.ASSORT_WINDOW_DAYS};
+function renderPull(){
+  if(!M.assortStores || !M.assortStores.length){
+    return `<p class="lead">Recovers pieces from stores where a set is broken and the held pieces are barely selling.</p>
+      <div class="card"><div class="card-b"><div class="empty">Needs store-level stock in the Inventory sheet (LocCode = store code) and pairing definitions. Once present, pull-back suggestions appear here.</div></div></div>`;
+  }
+  const sopts=['<option value="__ALL__">All stores</option>'].concat(M.assortStores.map(c=>{
+    const nm=(M.storeAssort.find(r=>r.scode===c)||{}).store||c;
+    return `<option value="${c}"${pullOpts.store===c?' selected':''}>${nm}</option>`;})).join('');
+  const hiers=[...new Set(M.storeAssort.map(r=>r.hier).filter(Boolean))].sort();
+  const hopts=['<option value="__ALL__">All types</option>'].concat(hiers.map(hi=>
+    `<option value="${hi}"${pullOpts.hier===hi?' selected':''}>${hi}</option>`)).join('');
+  let h=`<p class="lead">When a store holds a set whose <b>matching piece has sold out</b>, the remaining pieces can no longer sell as a set. Where those held pieces are also <b>selling slowly</b>, ARS recommends <b>pulling them back to the warehouse</b> so Vimal can reallocate them to fill orders — instead of leaving the capital stuck or creating fresh movement.</p>`;
+  h+=`<div class="kpis" id="pull-kpis" style="margin-bottom:18px"></div>`;
+  h+=`<div class="card"><div class="tool">
+      <div class="fld"><label>Store</label><select id="pb-store" style="min-width:170px">${sopts}</select></div>
+      <div class="fld"><label>Hierarchy</label><select id="pb-hier" style="min-width:130px">${hopts}</select></div>
+      <div class="fld"><label>Max sell-through %</label><input type="number" id="pb-st" value="${pullOpts.maxST}" min="0" max="100" style="min-width:120px"></div>
+      <div class="fld"><label>Window (days)</label><input type="number" id="pb-days" value="${pullOpts.days}" min="7" max="365" style="min-width:90px"></div>
+      <button class="btn primary" onclick="fillPull()">↻ Update</button>
+      <div id="pb-summary" style="margin-left:auto;align-self:center;font-size:12.5px;color:var(--ink-soft)"></div>
+    </div>
+    <table><thead><tr><th>Store</th><th>Style</th><th>Hierarchy</th><th>Colour</th><th>Held pieces (slow)</th><th>Set broken — missing</th>
+      <th class="r">Sell-thru</th><th class="r">Pull units</th><th class="r">Value</th><th class="r">Action</th></tr></thead>
+      <tbody id="pull-rows"></tbody></table></div>`;
+  return h;
+}
+function fillPull(){
+  const sEl=document.getElementById('pb-store');
+  if(sEl) pullOpts={store:sEl.value, hier:document.getElementById('pb-hier').value,
+    maxST:Math.min(100,Math.max(0,parseInt(document.getElementById('pb-st').value)||Math.round(CFG.PULLBACK_SELLTHRU*100))),
+    days:Math.max(7,parseInt(document.getElementById('pb-days').value)||CFG.ASSORT_WINDOW_DAYS)};
+  let rows=pullBackPlan(M.salesRecs, M.invRecs, M.setComps||{}, M.modelHier, M.dataNow, pullOpts.days, pullOpts.maxST/100);
+  if(pullOpts.store!=='__ALL__') rows=rows.filter(r=>r.scode===pullOpts.store);
+  if(pullOpts.hier!=='__ALL__') rows=rows.filter(r=>r.hier===pullOpts.hier);
+  const units=rows.reduce((a,r)=>a+r.pullUnits,0), val=rows.reduce((a,r)=>a+r.value,0);
+  const stores=new Set(rows.map(r=>r.scode)).size;
+  const kp=document.getElementById('pull-kpis');
+  if(kp) kp.innerHTML=[
+    ['Pull-back lines', rows.length, 'broken + slow'],
+    ['Units to recover', units.toLocaleString('en-IN'), 'back to warehouse'],
+    ['Value freed', fmtN(val), 'capital to redeploy'],
+    ['Stores affected', stores, 'holding broken sets'],
+  ].map(k=>`<div class="kpi"><div class="k">${k[0]}</div><div class="v num">${k[1]}</div><div class="d">${k[2]}</div></div>`).join('');
+  const tb=document.getElementById('pull-rows'); if(!tb) return;
+  tb.innerHTML = rows.length ? rows.slice(0,400).map(r=>`<tr>
+    <td>${r.store}</td><td class="style-name">${r.model}</td>
+    <td><span class="store-tag">${r.hier||'—'}</span></td><td>${colorChip(r.color)}</td>
+    <td style="font-size:12px">${r.present.map(p=>`${p.comp} ${p.onhand}<span style="color:var(--ink-soft)"> (${(p.st*100).toFixed(0)}% ST)</span>`).join(', ')}</td>
+    <td><span class="pill hi">${r.missing.map(m=>m.toLowerCase()).join(', ')} sold out</span></td>
+    <td class="r qty">${(r.sellThru*100).toFixed(0)}%</td>
+    <td class="r qty"><b>${r.pullUnits}</b></td><td class="r qty">${r.value?fmtN(r.value):'—'}</td>
+    <td class="r"><button class="ack" onclick="ack('${r.key}')">⤺ Recall ${r.pullUnits}</button></td></tr>`).join('')
+    : `<tr><td colspan="10" class="empty">No broken-and-slow sets to pull back for this filter.</td></tr>`;
+  const sm=document.getElementById('pb-summary');
+  if(sm) sm.innerHTML=`<b style="color:var(--terracotta)">${rows.length}</b> lines · <b>${units}</b> units · <b>${fmtN(val)}</b> to redeploy`;
+}
 function renderAI(){
   let h=`<p class="lead">An <b>offline answer engine</b> that reads your live metrics and replies instantly — daily briefing and free-text Q&amp;A, no internet round-trip, works the same for everyone on the team. If the page happens to be open inside Claude.ai, it quietly adds a richer Claude write-up on top.</p>`;
   // daily snapshot KPIs
@@ -1567,7 +1668,7 @@ function renderData(){
 }
 
 /* ===================== ROUTER + ACTIONS ===================== */
-const RENDER={overview:renderOverview,alerts:renderAlerts,alloc:renderAlloc,sets:renderSets,fast:renderFast,assort:renderAssort,rebal:renderRebalance,ai:renderAI,data:renderData};
+const RENDER={overview:renderOverview,alerts:renderAlerts,alloc:renderAlloc,sets:renderSets,fast:renderFast,assort:renderAssort,rebal:renderRebalance,pull:renderPull,ai:renderAI,data:renderData};
 let current='overview';
 function go(v){
   current=v;
@@ -1579,6 +1680,7 @@ function go(v){
   if(v==='alerts') fillAlerts();
   if(v==='assort') fillAssort();
   if(v==='rebal') fillRebalance();
+  if(v==='pull') fillPull();
   if(v==='data') mountFallback();
   window.scrollTo(0,0);
 }
