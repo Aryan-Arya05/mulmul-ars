@@ -479,6 +479,71 @@ function assortRows(salesRecs, stockMap, dataNow, days, keepThr, hierMap){
   });
   return rows.sort((a,b)=> b.onhand-a.onhand);
 }
+/* size-level assortment rows: per store × style × colour × SIZE (for size-wise rebalance) */
+function assortRowsSize(salesRecs, invRecs, dataNow, days, keepThr, hierMap){
+  const since=new Date(dataNow.getTime()-days*86400000);
+  const sold={};
+  salesRecs.forEach(s=>{ if(s.stype!=='Stores'||!s.date||s.date<since||s.comp==='Other'||!s.size)return;
+    const k=s.scode+'|'+s.model+'|'+(s.color||'')+'|'+s.size; sold[k]=(sold[k]||0)+s.qty; });
+  const stock={};
+  (invRecs||[]).forEach(i=>{ if(i.ltype!=='Stores'||i.comp==='Other'||!i.size)return;
+    const store=shortName(STOREMAP[i.loc]?.name||i.loc);
+    const k=i.loc+'|'+i.model+'|'+(i.color||'')+'|'+i.size;
+    const e=stock[k]||(stock[k]={onhand:0,mrp:i.mrp,store,comp:i.comp});
+    e.onhand+=i.avail; if(!e.mrp&&i.mrp)e.mrp=i.mrp; });
+  const pick=o=>o&&Object.keys(o).sort((a,b)=>o[b]-o[a])[0];
+  const hierOf=(model,color)=> hierMap ? (pick(hierMap[model+'|'+(color||'')])||pick(hierMap[model])||'') : '';
+  const keys=new Set([...Object.keys(sold),...Object.keys(stock)]);
+  const rows=[];
+  keys.forEach(k=>{
+    const parts=k.split('|'), scode=parts[0], model=parts[1], color=parts[2]||'', size=parts[3]||'';
+    const u=sold[k]||0, st=stock[k]||{onhand:0,mrp:0,store:(STOREMAP[scode]?shortName(STOREMAP[scode].name):scode),comp:''};
+    const onhand=st.onhand;
+    if(u===0 && onhand===0) return;
+    const sellThru=(u+onhand)>0 ? u/(u+onhand) : 0;
+    const wkRate=u/(days/7), coverWk = wkRate>0 ? onhand/wkRate : (onhand>0?99:0);
+    const vd=assortVerdict(u,onhand,sellThru,coverWk,keepThr);
+    rows.push({scode, store:st.store||scode, model, color, size, comp:st.comp, hier:hierOf(model,color),
+               sold:u, onhand, sellThru, coverWk, value:Math.round(onhand*(st.mrp||0)), verdict:vd.v, tone:vd.t});
+  });
+  return rows;
+}
+/* size-wise rebalance: match a dead store's surplus of a SIZE to a store that needs that same SIZE. Pure. */
+function rebalancePlanSize(rows, days, minQty){
+  minQty=minQty||CFG.REBALANCE_MIN_QTY;
+  const wk=days/7, targetWk=CFG.REBALANCE_COVER_WK, keepWk=CFG.REBALANCE_DONOR_KEEP_WK;
+  const groups={}; rows.forEach(r=>{ const k=r.model+'|'+(r.color||'')+'|'+r.size; (groups[k]=groups[k]||[]).push(r); });
+  const transfers=[], recalls=[];
+  Object.values(groups).forEach(g=>{
+    const unit=r=>r.onhand? r.value/r.onhand : 0;
+    const donors=g.filter(r=>r.verdict==='Pull'&&r.onhand>0).map(r=>{
+      const rate=r.sold/wk; return {...r, surplus:Math.max(0, r.onhand-Math.ceil(rate*keepWk))};
+    }).filter(d=>d.surplus>0).sort((a,b)=>b.surplus-a.surplus);
+    if(!donors.length) return;
+    const receivers=g.filter(r=>r.verdict==='Reorder'||(r.verdict==='Keep'&&r.coverWk<targetWk)).map(r=>{
+      const rate=r.sold/wk; return {...r, need:Math.max(0, Math.ceil(rate*targetWk)-r.onhand)};
+    }).filter(x=>x.need>0).sort((a,b)=> b.sellThru-a.sellThru || b.need-a.need);
+    let ri=0;
+    donors.forEach(d=>{
+      let avail=d.surplus;
+      while(avail>=minQty && ri<receivers.length){
+        const rcv=receivers[ri];
+        if(rcv.need<minQty){ ri++; continue; }
+        const q=Math.min(avail, rcv.need);
+        transfers.push({model:d.model,color:d.color,size:d.size,hier:d.hier,comp:d.comp,
+          from:d.store,fromCode:d.scode,fromST:d.sellThru,fromStock:d.onhand,
+          to:rcv.store,toCode:rcv.scode,toST:rcv.sellThru,toCover:rcv.coverWk,toVerdict:rcv.verdict,
+          qty:q, value:Math.round(q*unit(d))});
+        avail-=q; rcv.need-=q; if(rcv.need<=0) ri++;
+      }
+      if(avail>=minQty) recalls.push({model:d.model,color:d.color,size:d.size,hier:d.hier,comp:d.comp,
+        store:d.store,scode:d.scode, units:avail, sellThru:d.sellThru, value:Math.round(avail*unit(d)), buyer:receivers.length>0});
+    });
+  });
+  transfers.sort((a,b)=> b.qty-a.qty);
+  recalls.sort((a,b)=> b.units-a.units);
+  return {transfers, recalls};
+}
 /* aggregate small/all-size movement in a window; pure (no globals except CFG) */
 function aggFast(sales, onHandMap, dataNow, days, minU, scope, storeInvKnown){
   const since=new Date(dataNow.getTime()-days*86400000);
@@ -686,7 +751,7 @@ function build(){
     e.onhand+=i.avail; });
   const storeAssort = assortRows(sales, storeStock, dataNow, CFG.ASSORT_WINDOW_DAYS, CFG.ASSORT_KEEP_ST, modelHier);
   const assortStores = [...new Set(storeAssort.map(r=>r.scode))].sort();
-  const rebalance = rebalancePlan(storeAssort, CFG.ASSORT_WINDOW_DAYS, CFG.REBALANCE_MIN_QTY);
+  const rebalance = rebalancePlanSize(assortRowsSize(sales, inv, dataNow, CFG.ASSORT_WINDOW_DAYS, CFG.ASSORT_KEEP_ST, modelHier), CFG.ASSORT_WINDOW_DAYS, CFG.REBALANCE_MIN_QTY);
   diag.nStoreInv = inv.filter(i=>i.ltype==='Stores'&&i.comp!=='Other').length;
   diag.invLocs = [...new Set(inv.map(i=>i.loc))].slice(0,16);
 
@@ -1349,7 +1414,7 @@ function renderRebalance(){
   const hopts=['<option value="__ALL__">All types</option>'].concat(hiers.map(hi=>
     `<option value="${hi}"${rebalOpts.hier===hi?' selected':''}>${hi}</option>`)).join('');
   const showSel=v=>rebalOpts.show===v?' selected':'';
-  let h=`<p class="lead">For each style + colour, ARS finds stores where it's <b>dead/overstocked</b> and stores where it's <b>selling</b>, then suggests a transfer sized to the receiving store's demand. Styles selling <b>nowhere</b> are recalled to the warehouse. Transfers can move store-to-store directly or route via the warehouse.</p>`;
+  let h=`<p class="lead">For each style + colour <b>and size</b>, ARS finds stores where it's <b>dead/overstocked</b> and stores where the <b>same size</b> is selling, then suggests a size-matched transfer sized to the receiving store's demand. Sizes selling <b>nowhere</b> are recalled to the warehouse.</p>`;
   h+=`<div class="kpis" id="rebal-kpis" style="margin-bottom:18px"></div>`;
   h+=`<div class="card"><div class="tool">
       <div class="fld"><label>Store</label><select id="rb-store" style="min-width:170px">${sopts}</select></div>
@@ -1365,11 +1430,11 @@ function renderRebalance(){
       <button class="btn primary" onclick="fillRebalance()">↻ Update</button>
       <div id="rb-summary" style="margin-left:auto;align-self:center;font-size:12.5px;color:var(--ink-soft)"></div>
     </div></div>`;
-  h+=`<div class="card" id="rb-transfers-card" style="margin-top:18px"><div class="card-h"><h3>⇄ Suggested store-to-store transfers</h3><div class="sub">move surplus to where it sells</div></div>
-    <table><thead><tr><th>Style</th><th>Hierarchy</th><th>Colour</th><th>From (dead)</th><th>→ To (selling)</th><th class="r">Move qty</th><th class="r">Value</th><th class="r">Action</th></tr></thead>
+  h+=`<div class="card" id="rb-transfers-card" style="margin-top:18px"><div class="card-h"><h3>⇄ Suggested size-wise transfers</h3><div class="sub">move surplus of a size to a store selling that same size</div></div>
+    <table><thead><tr><th>Style</th><th>Hierarchy</th><th>Colour</th><th class="c">Size</th><th>From (dead)</th><th>→ To (selling)</th><th class="r">Move qty</th><th class="r">Value</th><th class="r">Action</th></tr></thead>
       <tbody id="rebal-rows"></tbody></table></div>`;
-  h+=`<div class="card" id="rb-recall-card" style="margin-top:18px"><div class="card-h"><h3>⎙ Recall to warehouse</h3><div class="sub">dead stock with no store selling it</div></div>
-    <table><thead><tr><th>Style</th><th>Hierarchy</th><th>Colour</th><th>From store</th><th class="r">Units</th><th class="r">Value</th><th>Why</th></tr></thead>
+  h+=`<div class="card" id="rb-recall-card" style="margin-top:18px"><div class="card-h"><h3>⎙ Recall to warehouse</h3><div class="sub">size with stock but no store selling it</div></div>
+    <table><thead><tr><th>Style</th><th>Hierarchy</th><th>Colour</th><th class="c">Size</th><th>From store</th><th class="r">Units</th><th class="r">Value</th><th>Why</th></tr></thead>
       <tbody id="recall-rows"></tbody></table></div>`;
   return h;
 }
@@ -1379,8 +1444,8 @@ function fillRebalance(){
                      show:document.getElementById('rb-show').value,
                      days:Math.max(7,parseInt(dEl.value)||CFG.ASSORT_WINDOW_DAYS),
                      minQty:Math.max(1,parseInt(document.getElementById('rb-min').value)||CFG.REBALANCE_MIN_QTY)};
-  const rows=assortRows(M.salesRecs, M.storeStock, M.dataNow, rebalOpts.days, CFG.ASSORT_KEEP_ST, M.modelHier);
-  let {transfers,recalls}=rebalancePlan(rows, rebalOpts.days, rebalOpts.minQty);
+  const rows=assortRowsSize(M.salesRecs, M.invRecs, M.dataNow, rebalOpts.days, CFG.ASSORT_KEEP_ST, M.modelHier);
+  let {transfers,recalls}=rebalancePlanSize(rows, rebalOpts.days, rebalOpts.minQty);
   // filters
   const st=rebalOpts.store, hi=rebalOpts.hier;
   if(hi!=='__ALL__'){ transfers=transfers.filter(t=>t.hier===hi); recalls=recalls.filter(r=>r.hier===hi); }
@@ -1396,27 +1461,29 @@ function fillRebalance(){
   const recallUnits=recalls.reduce((a,r)=>a+r.units,0), recallVal=recalls.reduce((a,r)=>a+r.value,0);
   const kp=document.getElementById('rebal-kpis');
   if(kp) kp.innerHTML=[
-    ['Transfer suggestions', transfers.length, 'store → store'],
+    ['Size transfers', transfers.length, 'store → store, size-matched'],
     ['Units to move', moveUnits.toLocaleString('en-IN'), 'redeployed to demand'],
     ['Value redeployed', fmtN(moveVal), 'dead → selling'],
     ['Recall to WH', recalls.length+' lines', recallUnits.toLocaleString('en-IN')+' units · '+fmtN(recallVal)],
   ].map(k=>`<div class="kpi"><div class="k">${k[0]}</div><div class="v num">${k[1]}</div><div class="d">${k[2]}</div></div>`).join('');
   const tb=document.getElementById('rebal-rows');
-  if(tb) tb.innerHTML = transfers.length ? transfers.slice(0,300).map(t=>`<tr>
+  if(tb) tb.innerHTML = transfers.length ? transfers.slice(0,400).map(t=>`<tr>
       <td class="style-name">${t.model}</td><td><span class="store-tag">${t.hier||'—'}</span></td><td>${colorChip(t.color)}</td>
+      <td class="c"><span class="store-tag" style="font-weight:600">${t.size}</span></td>
       <td>${t.from} <span style="color:var(--terracotta);font-size:11px">· ${(t.fromST*100).toFixed(0)}% ST, ${t.fromStock} on hand</span></td>
       <td><b>${t.to}</b> <span style="color:var(--teal);font-size:11px">· ${t.toVerdict==='Reorder'?'sold out, selling':(t.toST*100).toFixed(0)+'% ST, '+t.toCover.toFixed(1)+'w cover'}</span></td>
       <td class="r qty"><b>${t.qty}</b></td><td class="r qty">${t.value?fmtN(t.value):'—'}</td>
-      <td class="r"><button class="ack" onclick="ack('rb|${t.fromCode}${t.toCode}${t.model}${t.color}')">✓ Plan</button></td></tr>`).join('')
-    : `<tr><td colspan="8" class="empty">No transfer opportunities for this filter.</td></tr>`;
+      <td class="r"><button class="ack" onclick="ack('rb|${t.fromCode}${t.toCode}${t.model}${t.color}${t.size}')">✓ Plan</button></td></tr>`).join('')
+    : `<tr><td colspan="9" class="empty">No size-wise transfer opportunities for this filter.</td></tr>`;
   const rc=document.getElementById('recall-rows');
-  if(rc) rc.innerHTML = recalls.length ? recalls.slice(0,300).map(r=>`<tr>
-      <td class="style-name">${r.model}</td><td><span class="store-tag">${r.hier||'—'}</span></td><td>${colorChip(r.color)}</td><td>${r.store}</td>
+  if(rc) rc.innerHTML = recalls.length ? recalls.slice(0,400).map(r=>`<tr>
+      <td class="style-name">${r.model}</td><td><span class="store-tag">${r.hier||'—'}</span></td><td>${colorChip(r.color)}</td>
+      <td class="c"><span class="store-tag" style="font-weight:600">${r.size}</span></td><td>${r.store}</td>
       <td class="r qty">${r.units}</td><td class="r qty">${r.value?fmtN(r.value):'—'}</td>
       <td style="font-size:12px;color:var(--ink-soft)">${r.buyer?'leftover after transfers':'not selling at any store'}</td></tr>`).join('')
-    : `<tr><td colspan="7" class="empty">Nothing to recall for this filter.</td></tr>`;
+    : `<tr><td colspan="8" class="empty">Nothing to recall for this filter.</td></tr>`;
   const sm=document.getElementById('rb-summary');
-  if(sm) sm.innerHTML=`<b style="color:var(--teal)">${transfers.length}</b> transfers · <b>${moveUnits}</b> units moved · <b style="color:var(--terracotta)">${recalls.length}</b> recall lines`;
+  if(sm) sm.innerHTML=`<b style="color:var(--teal)">${transfers.length}</b> size transfers · <b>${moveUnits}</b> units moved · <b style="color:var(--terracotta)">${recalls.length}</b> recall lines`;
 }
 function renderAI(){
   let h=`<p class="lead">An <b>offline answer engine</b> that reads your live metrics and replies instantly — daily briefing and free-text Q&amp;A, no internet round-trip, works the same for everyone on the team. If the page happens to be open inside Claude.ai, it quietly adds a richer Claude write-up on top.</p>`;
