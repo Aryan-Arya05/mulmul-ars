@@ -193,7 +193,7 @@
       <div class="top-right">
         <span class="livechip" id="livechip"><span class="lp"></span> Connecting…</span>
         <button class="btn" onclick="refresh(true)">↻ Refresh</button>
-        <button class="btn primary" onclick="exportPlan()">⤓ Export plan</button>
+        <button class="btn primary" onclick="exportCurrentView()">⤓ Export</button>
       </div>
     </div>
     <div class="view" id="view"></div>
@@ -297,7 +297,7 @@ function compOf(...fields){
   if(/^\s*(chunni|dupatta)/.test(primary)) return 'Dupatta';
   const s=' '+parts.join(' ')+' ';                             // fall back to keyword search across all fields
   if(/\b(dupatta|chunni|odhani|odhna|stole|chunari)\b/.test(s)) return 'Dupatta';
-  if(/\b(pant|pants|palazzo|palazzos|trouser|trousers|salwar|churidar|sharara|garara|dhoti|culotte|pyjama|pajama|legging|leggings|skirt)\b/.test(s)) return 'Pant';
+  if(/\b(pant|pants|palazzo|palazzos|trouser|trousers|salwar|churidar|sharara|garara|dhoti|culotte|pyjama|pajama|legging|leggings|skirt|lehenga|lehnga|lehanga|ghagra|chaniya)\b/.test(s)) return 'Pant';
   if(/\b(kurta|kurti|kurtas|tunic|top|tops|blouse|choli|anarkali|kaftan|kaftaan|jacket|shrug|cape|gown|dress|jumpsuit|coord|co-ord)\b/.test(s)) return 'Kurta';
   return 'Other';
 }
@@ -638,19 +638,23 @@ function build(){
       {sku:String(col(r,'Product 2 SKU')||'').trim(), name:String(col(r,'Product 2')||'').trim()},
       {sku:String(col(r,'Product 3 SKU')||'').trim(), name:String(col(r,'Product 3')||'').trim()},
     ].filter(p=>p.sku && p.sku!=='0' && p.name && p.name!=='0');
-    if(prods.length<2) return;                              // standalone item (saree/dress) — not a set
+    if(prods.length<1) return;                              // truly empty row
     pairDefs++;
     const label=prods[0].name;
+    const size=String(col(r,'SIZE')||col(r,'Size')||'').trim();
     const colour=invBySku[prods[0].sku.toUpperCase()]?.color || '';
     const key=String(col(r,'Key')||(label+'|'+colour)).trim();
-    const g=setAgg[key]||(setAgg[key]={key,label,colour,k:0,p:0,d:0,present:new Set(),matched:0,total:0});
+    const g=setAgg[key]||(setAgg[key]={key,label,colour,k:0,p:0,d:0,present:new Set(),matched:0,total:0,kind:prods.length,items:[]});
     if(!g.colour&&colour) g.colour=colour;
-    prods.forEach(p=>{
+    g.kind=Math.max(g.kind,prods.length);
+    prods.forEach((p,idx)=>{
       g.total++; pairSkuTotal++;
       const e=invBySku[p.sku.toUpperCase()]; const av=e?e.avail:0; if(e){g.matched++; pairMatched++;}
-      let c=compOf(p.name); if(c==='Other') c='Kurta';     // P1 tops (Top/Dress) bucket as the lead garment
+      let c=compOf(p.name); if(c==='Other'&&idx===0) c='Kurta';   // only the lead garment falls back to Kurta
+      if(c==='Other') c='Dupatta';                                 // any other accessory → 3rd-piece bucket
       if(c==='Kurta') g.k+=av; else if(c==='Pant') g.p+=av; else g.d+=av;
       g.present.add(c);
+      g.items.push({sku:p.sku.toUpperCase(),name:p.name,comp:c,size,av});
     });
   });
   const inwardSets=Object.values(setAgg).map(g=>{
@@ -658,7 +662,11 @@ function build(){
     const avails=present.map(c=>vals[c]);
     const sets=avails.length?Math.min(...avails):0, mx=avails.length?Math.max(...avails):0;
     const pending=present.filter(c=>vals[c]<mx).map(c=>({c,n:mx-vals[c]})).filter(x=>x.n>0);
-    return {model:g.label,color:g.colour,k:g.k,p:g.p,d:g.d,sets,pending,matched:g.matched,total:g.total};
+    // SKU-level shortfall: components whose available is below the set target (mx)
+    const skuShort=g.items.filter(it=>it.av<mx).map(it=>({...it,short:mx-it.av}))
+                          .sort((a,b)=>b.short-a.short);
+    return {model:g.label,color:g.colour,k:g.k,p:g.p,d:g.d,sets,pending,matched:g.matched,total:g.total,
+            kind:g.kind,items:g.items,skuShort,target:mx};
   }).filter(s=>(s.k+s.p+s.d)>0).sort((a,b)=>{
     const ap=a.pending.reduce((x,y)=>x+y.n,0),bp=b.pending.reduce((x,y)=>x+y.n,0); return bp-ap;
   });
@@ -729,7 +737,7 @@ function build(){
   M={dataNow,physStores,storeProfiles,fastSize,fastStyles,inwardSets,incompleteSets,dispatchSets,
      storeUnits7,units7,rev7,byDay,dayKeys,today,yday,todayK:dayKeys[dayKeys.length-1],ydayK:dayKeys[dayKeys.length-2],
      channel:{online:onl,offline:off},
-     salesRecs:sales, storeOnHand, hasStoreInv, diag,
+     salesRecs:sales, storeOnHand, hasStoreInv, diag, invRecs:inv,
      storeStock, storeAssort, assortStores, rebalance, modelHier,
      totalInvUnits:inv.reduce((a,i)=>a+i.avail,0),
      salesRows:RAW.sales.length, invRows:RAW.inventory.length,
@@ -803,6 +811,7 @@ function renderOverview(){
 }
 
 let alertOpts={days:CFG.FAST_WINDOW_DAYS, minU:CFG.SIZE_ALERT_MIN_UNITS, scope:'small', onlyFlag:false, store:'__ALL__', comp:'__ALL__'};
+let sizeRptMode='all';
 function renderAlerts(){
   const stMap={}; const comps=new Set();
   (M.salesRecs||[]).forEach(s=>{ if(s.stype==='Stores'&&s.comp!=='Other'){ stMap[s.scode]=s.store; comps.add(s.comp); } });
@@ -824,6 +833,13 @@ function renderAlerts(){
     <table><thead><tr><th>Style</th><th>Colour</th><th>Comp</th><th>Size</th><th>Store</th><th class="r">Sold</th>
       <th class="r">Store o/h</th><th class="r">Suggest</th><th class="c">Priority</th><th class="r">Action</th></tr></thead>
       <tbody id="alert-rows"></tbody></table></div>`;
+  h+=`<div class="card" style="margin-top:18px"><div class="card-h"><h3>↕ Sizes — available vs sold</h3>
+      <div class="sub">Every size against total available stock and quantity sold in the window</div>
+      <select id="sz-mode" style="margin-left:auto;min-width:150px" onchange="fillAlerts()">
+        <option value="all"${sizeRptMode==='all'?' selected':''}>All stores (totals)</option>
+        <option value="store"${sizeRptMode==='store'?' selected':''}>Store-wise</option>
+      </select></div>
+    <table id="sz-table"><tbody id="size-rpt"></tbody></table></div>`;
   return h;
 }
 function fillAlerts(){
@@ -853,6 +869,48 @@ function fillAlerts(){
     : `<tr><td colspan="10" class="empty">No size movement in the last ${alertOpts.days} day(s) for the chosen scope.</td></tr>`;
   const sm=document.getElementById('al-summary');
   if(sm) sm.innerHTML=`Showing <b>${shown.length}</b> of ${total} lines &#183; <b style="color:var(--terracotta)">${flagged}</b> flagged for replenishment`;
+
+  /* ---- Sizes: available vs sold report ---- */
+  const me=document.getElementById('sz-mode'); if(me) sizeRptMode=me.value;
+  const from=new Date(M.dataNow.getTime()-alertOpts.days*86400000);
+  const inScope=sz=>alertOpts.scope==='all'?!!sz:CFG.SMALL_SIZES.includes(sz);
+  const stMatch=(scode)=>alertOpts.store==='__ALL__'||scode===alertOpts.store;
+  const cMatch=(c)=>alertOpts.comp==='__ALL__'||c===alertOpts.comp;
+  const agg={};
+  // sold (store sales in window)
+  (M.salesRecs||[]).forEach(s=>{
+    if(s.stype!=='Stores'||s.comp==='Other'||!s.size||!s.date||s.date<from) return;
+    if(!inScope(s.size)||!cMatch(s.comp)||!stMatch(s.scode)) return;
+    const k=sizeRptMode==='store'?(s.store+'|'+s.comp+'|'+s.size):(s.comp+'|'+s.size);
+    const e=agg[k]||(agg[k]={store:s.store,comp:s.comp,size:s.size,sold:0,avail:0});
+    e.sold+=s.qty;
+  });
+  // available (store stock; if a store filter is set, only that store, else all stores)
+  (M.invRecs||[]).forEach(i=>{
+    if(i.ltype!=='Stores'||i.comp==='Other'||!i.size) return;
+    if(!inScope(i.size)||!cMatch(i.comp)||!stMatch(i.loc)) return;
+    const store=shortName(STOREMAP[i.loc]?.name||i.loc);
+    const k=sizeRptMode==='store'?(store+'|'+i.comp+'|'+i.size):(i.comp+'|'+i.size);
+    const e=agg[k]||(agg[k]={store,comp:i.comp,size:i.size,sold:0,avail:0});
+    e.avail+=i.avail;
+  });
+  const order=s=>{const idx=SIZE_ORDER.indexOf(s);return idx<0?99:idx;};
+  const list=Object.values(agg).sort((a,b)=>
+    sizeRptMode==='store' ? (a.store||'').localeCompare(b.store||'')||a.comp.localeCompare(b.comp)||order(a.size)-order(b.size)
+                          : a.comp.localeCompare(b.comp)||order(a.size)-order(b.size));
+  const head = sizeRptMode==='store'
+    ? `<thead><tr><th>Store</th><th>Comp</th><th>Size</th><th class="r">Available</th><th class="r">Sold</th><th class="r">Sell-through</th></tr></thead>`
+    : `<thead><tr><th>Comp</th><th>Size</th><th class="r">Available</th><th class="r">Sold</th><th class="r">Sell-through</th></tr></thead>`;
+  const body = list.length ? list.map(r=>{
+    const st = (r.sold+r.avail)>0 ? Math.round(r.sold/(r.sold+r.avail)*100) : 0;
+    const c = st>=70?'var(--terracotta)':st>=50?'var(--marigold)':'var(--ink-soft)';
+    const cells = (sizeRptMode==='store'?`<td>${r.store}</td>`:'')+
+      `<td><span class="store-tag">${r.comp}</span></td><td><span class="store-tag" style="font-weight:600">${r.size}</span></td>`+
+      `<td class="r qty">${r.avail}</td><td class="r qty">${r.sold}</td>`+
+      `<td class="r"><span class="num" style="color:${c}">${st}%</span></td>`;
+    return `<tr>${cells}</tr>`;
+  }).join('') : `<tr><td colspan="${sizeRptMode==='store'?6:5}" class="empty">No size data for this filter.</td></tr>`;
+  const szt=document.getElementById('sz-table'); if(szt) szt.innerHTML=head+'<tbody id="size-rpt">'+body+'</tbody>';
 }
 
 function renderAlloc(){
@@ -888,22 +946,54 @@ function computeAlloc(){
   document.getElementById('alloc-out').innerHTML=t;
 }
 
+let setOpts={style:'__ALL__'};
 function renderSets(){
-  let h=`<p class="lead">Every set is defined in your <b>Styles Pairing Sheet</b> (Product 1 + Product 2 + Product 3 by SKU). ARS looks up live stock for each component, so a set completes only when all its paired pieces are available in the same colourway. Checked at <b>inward</b> (do the paired counts form whole sets?) and at <b>store</b> (is one sold-out piece breaking otherwise-complete sets?).</p>
-  <div class="legend" style="margin-bottom:14px"><span><span class="compdot" style="background:var(--indigo)"></span> Kurta</span>
-    <span><span class="compdot" style="background:var(--marigold)"></span> Pant</span><span><span class="compdot" style="background:var(--teal)"></span> Dupatta</span></div>`;
-  const inc=M.incompleteSets.slice(0,25);
-  h+=`<div class="card"><div class="card-h"><h3>❖ Inward — set matching (warehouse + all stock)</h3>
+  const styleList=[...new Set([].concat(M.inwardSets.map(s=>s.model), M.dispatchSets.map(d=>d.model)))].filter(Boolean).sort();
+  if(setOpts.style!=='__ALL__' && !styleList.includes(setOpts.style)) setOpts.style='__ALL__';
+  const sopts=['<option value="__ALL__">All styles</option>'].concat(styleList.map(s=>
+    `<option value="${s}"${setOpts.style===s?' selected':''}>${s}</option>`)).join('');
+  const byStyle = arr => setOpts.style==='__ALL__'?arr:arr.filter(x=>x.model===setOpts.style);
+
+  let h=`<p class="lead">Every set is defined in your <b>Styles Pairing Sheet</b> (Product 1 + Product 2 + Product 3 by SKU). ARS looks up live stock for each component, so a set completes only when all its paired pieces are available in the same colourway. Single-piece styles (a standalone Kurta) and two-piece sets (Lehenga + Kurta-Top) are now recognised alongside three-piece sets. Checked at <b>inward</b> (do the paired counts form whole sets?) and at <b>store</b> (is one sold-out piece breaking otherwise-complete sets?).</p>
+  <div class="legend" style="margin-bottom:14px"><span><span class="compdot" style="background:var(--indigo)"></span> Kurta / Top</span>
+    <span><span class="compdot" style="background:var(--marigold)"></span> Pant / Lehenga</span><span><span class="compdot" style="background:var(--teal)"></span> Dupatta</span></div>`;
+  h+=`<div class="card"><div class="tool">
+      <div class="fld"><label>Style</label><select id="set-style" style="min-width:180px" onchange="setOpts.style=this.value; go('sets')">${sopts}</select></div>
+      <div style="margin-left:auto;align-self:center;font-size:12.5px;color:var(--ink-soft)">Filter both tables and the SKU detail by style</div>
+    </div></div>`;
+
+  const inc=byStyle(M.incompleteSets).slice(0,40);
+  h+=`<div class="card" style="margin-top:18px"><div class="card-h"><h3>❖ Inward — set matching (warehouse + all stock)</h3>
       <div class="sub">Available qty by component, per colourway; flags the shortfall to complete sets</div>
       <span class="pill ${inc.length?'med':'ok'} tag">${inc.length} incomplete</span></div>
-    <table><thead><tr><th>Style</th><th>Colour</th><th class="c">Kurta</th><th class="c">Pant</th><th class="c">Dupatta</th><th class="r">Full sets</th><th>Status</th></tr></thead><tbody>`+
+    <table><thead><tr><th>Style</th><th>Colour</th><th class="c">Type</th><th class="c">Kurta</th><th class="c">Pant</th><th class="c">Dupatta</th><th class="r">Full sets</th><th>Status</th></tr></thead><tbody>`+
     (inc.length?inc.map(s=>`<tr><td class="style-name">${s.model}</td><td>${colorChip(s.color)}</td>
+      <td class="c"><span class="store-tag">${s.kind===1?'Single':s.kind===2?'2-pc':'3-pc'}</span></td>
       <td class="c qty">${s.k}</td><td class="c qty">${s.p}</td><td class="c qty">${s.d}</td>
       <td class="r qty"><b>${s.sets}</b></td>
       <td><span class="pill med">⏳ ${s.pending.map(p=>p.n+' '+p.c.toLowerCase()).join(', ')} short</span></td></tr>`).join('')
-     :`<tr><td colspan="7" class="empty">✓ All set components in balance.</td></tr>`)+
+     :`<tr><td colspan="8" class="empty">✓ All set components in balance for this filter.</td></tr>`)+
     `</tbody></table></div>`;
-  const disp=M.dispatchSets.filter(d=>!acked.has(d.key));
+
+  // SKU-level incomplete detail
+  const skuRows=[];
+  byStyle(M.incompleteSets).forEach(s=>{
+    (s.skuShort||[]).forEach(it=>skuRows.push({model:s.model,color:s.color,target:s.target,...it}));
+  });
+  skuRows.sort((a,b)=>b.short-a.short);
+  h+=`<div class="card" style="margin-top:18px"><div class="card-h"><h3>❖ Incomplete sets — SKU-level detail</h3>
+      <div class="sub">Exact component SKUs short of the set target, and by how many</div>
+      <span class="pill ${skuRows.length?'med':'ok'} tag">${skuRows.length} SKUs short</span></div>
+    <table><thead><tr><th>Style</th><th>Colour</th><th>Component</th><th>SKU</th><th class="c">Size</th><th class="r">Available</th><th class="r">Set target</th><th class="r">Short by</th></tr></thead><tbody>`+
+    (skuRows.length?skuRows.slice(0,400).map(r=>`<tr>
+      <td class="style-name">${r.model}</td><td>${colorChip(r.color)}</td>
+      <td><span class="store-tag">${r.comp}</span></td><td style="font-family:var(--mono);font-size:12px">${r.sku}</td>
+      <td class="c">${r.size||'—'}</td><td class="r qty">${r.av}</td><td class="r qty">${r.target}</td>
+      <td class="r qty"><b style="color:var(--terracotta)">${r.short}</b></td></tr>`).join('')
+     :`<tr><td colspan="8" class="empty">No SKU-level shortfalls for this filter.</td></tr>`)+
+    `</tbody></table></div>`;
+
+  const disp=byStyle(M.dispatchSets).filter(d=>!acked.has(d.key));
   h+=`<div class="card" style="margin-top:18px"><div class="card-h"><h3>❖ Store — missing-piece dispatch</h3>
       <div class="sub">Store has the set but one component is sold out → dispatch the same colourway from warehouse</div>
       <span class="pill ${disp.length?'hi':'ok'} tag">${disp.length} to dispatch</span></div>
@@ -913,7 +1003,7 @@ function renderSets(){
       <td><span class="pill ${d.wh>=d.need?'med':'hi'}">${d.need} ${d.miss.toLowerCase()} out</span></td>
       <td class="r qty">${d.wh}</td>
       <td class="r">${d.wh>=d.need?`<button class="ack" onclick="ack('${d.key}')">⤷ Dispatch ${d.need}</button>`:`<span class="pill hi">WH short → PO</span>`}</td></tr>`).join('')
-     :`<tr><td colspan="9" class="empty">No store-level inventory rows detected for store-set checks (inventory appears warehouse-only).</td></tr>`)+
+     :`<tr><td colspan="9" class="empty">No store-level missing-piece dispatches for this filter.</td></tr>`)+
     `</tbody></table></div>`;
   return h;
 }
@@ -1433,15 +1523,43 @@ function toggleNav(force){
   s.classList.toggle('open',open); sc.classList.toggle('show',open);
 }
 function ack(key){ acked.add(key); toast('Action queued'); badges(); if(current==='alerts') fillAlerts(); else go(current); }
+
+const csvEsc = s => `"${String(s==null?'':s).replace(/\u20b9/g,'Rs ').replace(/"/g,'""')}"`;
+function downloadCSV(text, fname){
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob(['\ufeff'+text],{type:'text/csv;charset=utf-8'}));
+  a.download=fname; a.click();
+}
+// Exports every report table in the current view, respecting on-screen filters.
+function exportCurrentView(){
+  const view=document.getElementById('view');
+  const tables=view?[...view.querySelectorAll('table')]:[];
+  if(!tables.length){ exportPlan(); return; }   // Overview / AI → consolidated plan
+  const out=[];
+  tables.forEach(tbl=>{
+    const card=tbl.closest('.card'); const h3=card&&card.querySelector('.card-h h3');
+    if(out.length) out.push('');
+    if(h3) out.push(csvEsc(h3.textContent.trim()));
+    const heads=[...tbl.querySelectorAll('thead th')].map(th=>th.textContent.replace(/\s+/g,' ').trim());
+    const drop=new Set(); heads.forEach((h,i)=>{ if(/^(action|act)$/i.test(h)) drop.add(i); });
+    out.push(heads.filter((_,i)=>!drop.has(i)).map(csvEsc).join(','));
+    tbl.querySelectorAll('tbody tr').forEach(tr=>{
+      const tds=[...tr.children]; if(tds.length<=1) return;   // skip empty-state rows
+      out.push(tds.map(td=>td.textContent.replace(/\s+/g,' ').trim())
+                  .filter((_,i)=>!drop.has(i)).map(csvEsc).join(','));
+    });
+  });
+  downloadCSV(out.join('\n'), 'mulmul_'+current+'_report.csv');
+  toast('Report exported');
+}
 function exportPlan(){
   const lines=[['Type','Style','Colour','Detail','Qty','Store/Loc']];
   M.fastSize.filter(a=>!acked.has(a.key)).forEach(a=>lines.push(['Size replen',a.model,a.color||'',a.comp+' '+a.size,'+'+a.replen,a.store]));
   M.incompleteSets.forEach(s=>s.pending.forEach(p=>lines.push(['Set shortfall',s.model,s.color||'',p.c+' pending',p.n,'Warehouse'])));
   M.dispatchSets.filter(d=>!acked.has(d.key)).forEach(d=>lines.push(['Dispatch',d.model,d.color||'',d.miss+' to store',d.need,d.store]));
   M.fastStyles.filter(s=>s.flag).forEach(s=>lines.push(['Re-order',s.model,s.color||'',(s.sellThru*100).toFixed(0)+'% sold',s.units7,'Buying']));
-  const csv=lines.map(r=>r.map(c=>`"${String(c).replace(/"/g,'""')}"`).join(',')).join('\n');
-  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));
-  a.download='mulmul_ars_plan.csv';a.click();toast('Replenishment plan exported');
+  downloadCSV(lines.map(r=>r.map(csvEsc).join(',')).join('\n'), 'mulmul_ars_plan.csv');
+  toast('Replenishment plan exported');
 }
 
 /* ===================== LIVE STATUS ===================== */
