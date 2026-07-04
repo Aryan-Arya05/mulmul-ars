@@ -178,6 +178,7 @@
     <div class="nav-item" data-view="assort"><span class="ico">▦</span> Store Assortment <span class="cnt muted" id="nav-assort">0</span></div>
     <div class="nav-item" data-view="rebal"><span class="ico">⇄</span> Stock Rebalance <span class="cnt muted" id="nav-rebal">0</span></div>
     <div class="nav-item" data-view="pull"><span class="ico">⤺</span> Pull-Back <span class="cnt muted" id="nav-pull">0</span></div>
+    <div class="nav-item" data-view="reorder"><span class="ico">🛒</span> Reorder Planning <span class="cnt muted" id="nav-reorder">0</span></div>
     <div class="nav-item" data-view="ai"><span class="ico">✦</span> AI Insights</div>
     <div class="nav-label">System</div>
     <div class="nav-item" data-view="data"><span class="ico">⎙</span> Data &amp; Sync</div>
@@ -234,6 +235,7 @@ const CFG = {
   REBALANCE_DONOR_KEEP_WK: 2,           // weeks of cover a slow donor keeps before surplus is moved
   REBALANCE_MIN_QTY: 2,                 // smallest worthwhile transfer
   PULLBACK_SELLTHRU: 0.30,              // pull back broken-set pieces selling below this
+  LEAD_TIME_DAYS: 21,                   // avg production/replenishment lead time for reorder sizing
 };
 const SIZE_ORDER = ['XS','S','M','L','XL','XXL'];
 const csvUrl = gid => `https://docs.google.com/spreadsheets/d/${CFG.SHEET_ID}/gviz/tq?tqx=out:csv&gid=${gid}`;
@@ -857,6 +859,7 @@ const TITLES={overview:['Replenishment','Overview'],alerts:['Demand Signal','Fas
   fast:['Velocity','Fast-Selling Style Reminders'],assort:['Inventory Policy','Store Assortment &amp; Sell-Through'],
   rebal:['Inventory Policy','Stock Rebalance &amp; Transfers'],
   pull:['Inventory Policy','Pull-Back — Recover Broken-Set Stock'],
+  reorder:['Velocity','Reorder Planning — Buyer Worksheet'],
   ai:['Intelligence','AI Insight Engine'],data:['System','Data &amp; Sync']};
 
 function badges(){
@@ -867,6 +870,8 @@ function badges(){
   set('nav-assort', (M.storeAssort||[]).filter(r=>r.verdict==='Pull').length);
   set('nav-rebal', (M.rebalance&&M.rebalance.transfers.length)||0);
   set('nav-pull', (M.invRecs&&M.setComps)? pullBackPlan(M.salesRecs,M.invRecs,M.setComps,M.modelHier,M.dataNow,CFG.ASSORT_WINDOW_DAYS,CFG.PULLBACK_SELLTHRU).length : 0);
+  try{ const rr=reorderPlan(M.salesRecs,M.invRecs,M.modelHier,M.dataNow,CFG.VELO_WINDOW_DAYS*4,CFG.LEAD_TIME_DAYS);
+       set('nav-reorder', rr.filter(r=>(reorderDecisions[r.model]||r.auto)==='Chase').length); }catch(e){ set('nav-reorder',0); }
 }
 
 function renderOverview(){
@@ -1586,6 +1591,108 @@ function fillPull(){
   const sm=document.getElementById('pb-summary');
   if(sm) sm.innerHTML=`<b style="color:var(--terracotta)">${rows.length}</b> lines · <b>${units}</b> units · <b>${fmtN(val)}</b> to redeploy`;
 }
+/* Reorder planning: turn velocity into a buying recommendation per style. Pure. */
+function reorderPlan(sales, inv, modelHier, dataNow, days, leadDays){
+  const since=new Date(dataNow.getTime()-days*86400000);
+  const sold={}, sizeMix={}, bal={};
+  (sales||[]).forEach(s=>{ if(!s.model||!s.date||s.date<since||s.qty<=0) return;
+    sold[s.model]=(sold[s.model]||0)+s.qty;
+    if(s.size){ (sizeMix[s.model]=sizeMix[s.model]||{})[s.size]=(sizeMix[s.model][s.size]||0)+s.qty; } });
+  (inv||[]).forEach(i=>{ if(!i.model||i.comp==='Other') return; bal[i.model]=(bal[i.model]||0)+i.avail; });
+  const pick=o=>o&&Object.keys(o).sort((a,b)=>o[b]-o[a])[0];
+  const catOf=m=> modelHier ? (pick(modelHier[m])||'') : '';
+  const models=new Set([...Object.keys(sold), ...Object.keys(bal)]);
+  const rows=[];
+  models.forEach(m=>{
+    const s=sold[m]||0, b=bal[m]||0, recv=s+b;
+    if(recv===0) return;
+    const sellThru=recv>0? s/recv : 0;
+    const velo=s/days;                                   // units/day
+    const cover=velo>0 ? b/velo : (b>0?999:0);           // days of stock left
+    const slack=cover-leadDays;                          // <0 => stocks out before a reorder can land
+    const rec=velo>0 ? Math.max(0, Math.ceil((velo*leadDays - b)/10)*10) : 0;
+    // size ratio string from sold mix
+    const mix=sizeMix[m]||{}; const tot=Object.values(mix).reduce((a,x)=>a+x,0);
+    const ratio=SIZE_ORDER.concat(Object.keys(mix).filter(z=>!SIZE_ORDER.includes(z)))
+      .filter(z=>mix[z]>0).map(z=>z+Math.round(mix[z]/tot*100)).join(' ');
+    // auto decision
+    let auto = sellThru>=CFG.REORDER_SELLTHRU && slack<0 ? 'Chase'
+             : sellThru>=0.50 ? 'Watch' : 'Drop';
+    rows.push({model:m, cat:catOf(m), recv, sold:s, balance:b, sellThru, velo, cover, slack, rec, ratio, auto});
+  });
+  return rows.sort((a,b)=> b.rec-a.rec || b.sellThru-a.sellThru);
+}
+let reorderOpts={cat:'__ALL__', minST:0, decision:'__ALL__', days:CFG.VELO_WINDOW_DAYS*4};
+function loadDecisions(){ try{ return JSON.parse(localStorage.getItem('ars_reorder_decisions')||'{}'); }catch(e){ return {}; } }
+let reorderDecisions=loadDecisions();
+function setReorderDecision(m,v){ reorderDecisions[m]=v; try{ localStorage.setItem('ars_reorder_decisions',JSON.stringify(reorderDecisions)); }catch(e){} fillReorder(); }
+function renderReorder(){
+  const catset=new Set();
+  Object.values(M.modelHier||{}).forEach(o=>{ if(o) Object.keys(o).forEach(k=>catset.add(k)); });
+  const cats=[...catset].filter(Boolean).sort();
+  const copts=['<option value="__ALL__">All categories</option>'].concat(cats.map(c=>`<option value="${c}"${reorderOpts.cat===c?' selected':''}>${c}</option>`)).join('');
+  const dsel=v=>reorderOpts.decision===v?' selected':'';
+  const msel=v=>reorderOpts.minST===v?' selected':'';
+  let h=`<p class="lead">Turns fast-seller velocity into buying decisions: how fast a style sells, when it will run out versus your <b>${CFG.LEAD_TIME_DAYS}-day</b> lead time, and the quantity + size ratio to reorder. A decision aid — it does <b>not</b> create POs.</p>`;
+  h+=`<div class="kpis" id="reorder-kpis" style="margin-bottom:18px"></div>`;
+  h+=`<div class="card"><div class="tool">
+      <div class="fld"><label>Category</label><select id="ro-cat" style="min-width:150px">${copts}</select></div>
+      <div class="fld"><label>Min sell-through</label><select id="ro-st" style="min-width:120px">
+        <option value="0"${msel(0)}>Any</option><option value="50"${msel(50)}>50%+</option>
+        <option value="60"${msel(60)}>60%+</option><option value="70"${msel(70)}>70%+</option><option value="80"${msel(80)}>80%+</option></select></div>
+      <div class="fld"><label>Decision</label><select id="ro-dec" style="min-width:120px">
+        <option value="__ALL__"${dsel('__ALL__')}>All</option><option value="Chase"${dsel('Chase')}>Chase</option>
+        <option value="Watch"${dsel('Watch')}>Watch</option><option value="Drop"${dsel('Drop')}>Drop</option></select></div>
+      <div class="fld"><label>Window (days)</label><input type="number" id="ro-days" value="${reorderOpts.days}" min="7" max="180" style="min-width:90px"></div>
+      <button class="btn primary" onclick="fillReorder()">↻ Update</button>
+      <div id="ro-summary" style="margin-left:auto;align-self:center;font-size:12.5px;color:var(--ink-soft)"></div>
+    </div>
+    <table><thead><tr><th>Style</th><th>Category</th><th class="r">Recv</th><th class="r">Sold</th><th class="r">Balance</th>
+      <th class="r">Sell-thru</th><th class="r">Velocity</th><th class="r">Proj. stock-out</th><th class="r">Reorder qty</th><th>Size ratio</th><th class="c">Decision</th></tr></thead>
+      <tbody id="reorder-rows"></tbody></table></div>`;
+  return h;
+}
+function fillReorder(){
+  const cEl=document.getElementById('ro-cat');
+  if(cEl) reorderOpts={cat:cEl.value, minST:parseInt(document.getElementById('ro-st').value)||0,
+                       decision:document.getElementById('ro-dec').value,
+                       days:Math.max(7,parseInt(document.getElementById('ro-days').value)||CFG.VELO_WINDOW_DAYS*4)};
+  let rows=reorderPlan(M.salesRecs, M.invRecs, M.modelHier, M.dataNow, reorderOpts.days, CFG.LEAD_TIME_DAYS);
+  const dec=r=>reorderDecisions[r.model]||r.auto;
+  if(reorderOpts.cat!=='__ALL__') rows=rows.filter(r=>r.cat===reorderOpts.cat);
+  if(reorderOpts.minST>0) rows=rows.filter(r=>r.sellThru*100>=reorderOpts.minST);
+  if(reorderOpts.decision!=='__ALL__') rows=rows.filter(r=>dec(r)===reorderOpts.decision);
+  const chase=rows.filter(r=>dec(r)==='Chase');
+  const totRec=chase.reduce((a,r)=>a+r.rec,0);
+  const kp=document.getElementById('reorder-kpis');
+  if(kp) kp.innerHTML=[
+    ['Chase candidates', chase.length, 'flagged to reorder'],
+    ['Recommended units', totRec.toLocaleString('en-IN'), 'across chase styles'],
+    ['Avg lead time', CFG.LEAD_TIME_DAYS+' days', 'configured'],
+    ['Styles reviewed', rows.length, 'in this window'],
+  ].map(k=>`<div class="kpi"><div class="k">${k[0]}</div><div class="v num">${k[1]}</div><div class="d">${k[2]}</div></div>`).join('');
+  const tb=document.getElementById('reorder-rows'); if(!tb) return;
+  const decColor={Chase:'var(--teal)',Watch:'var(--marigold-deep)',Drop:'var(--terracotta)'};
+  tb.innerHTML = rows.length ? rows.slice(0,400).map(r=>{
+    const d=dec(r); const stC=r.sellThru>=0.70?'var(--teal)':r.sellThru>=0.5?'var(--marigold-deep)':'var(--terracotta)';
+    const soC=r.slack<0?'var(--terracotta)':'var(--ink-soft)';
+    const so=r.slack<0? r.slack.toFixed(1)+'d' : (r.cover>=999?'—':'+'+r.slack.toFixed(1)+'d');
+    return `<tr>
+      <td class="style-name">${r.model}</td><td><span class="store-tag">${r.cat||'—'}</span></td>
+      <td class="r qty">${r.recv}</td><td class="r qty">${r.sold}</td><td class="r qty">${r.balance}</td>
+      <td class="r"><span class="num" style="color:${stC}">${(r.sellThru*100).toFixed(0)}%</span></td>
+      <td class="r qty">${r.velo.toFixed(1)}/d</td>
+      <td class="r" title="days of cover minus lead time; negative = stocks out before a reorder can arrive"><span class="num" style="color:${soC}">${so}</span></td>
+      <td class="r qty"><b>${r.rec||'—'}</b></td>
+      <td style="font-family:var(--mono);font-size:11px;color:var(--ink-soft)">${r.ratio||'—'}</td>
+      <td class="c"><select onchange="setReorderDecision('${r.model.replace(/'/g,"")}',this.value)" style="font-weight:600;color:${decColor[d]};border:1px solid var(--line);border-radius:8px;padding:4px 8px;background:var(--paper)">
+        <option value="Chase"${d==='Chase'?' selected':''}>Chase</option>
+        <option value="Watch"${d==='Watch'?' selected':''}>Watch</option>
+        <option value="Drop"${d==='Drop'?' selected':''}>Drop</option></select></td></tr>`;
+  }).join('') : `<tr><td colspan="11" class="empty">No styles match this filter.</td></tr>`;
+  const sm=document.getElementById('ro-summary');
+  if(sm) sm.innerHTML=`<b style="color:var(--teal)">${chase.length}</b> chase · <b>${totRec}</b> units · reorder = velocity × ${CFG.LEAD_TIME_DAYS}d − balance`;
+}
 function renderAI(){
   let h=`<p class="lead">An <b>offline answer engine</b> that reads your live metrics and replies instantly — daily briefing and free-text Q&amp;A, no internet round-trip, works the same for everyone on the team. If the page happens to be open inside Claude.ai, it quietly adds a richer Claude write-up on top.</p>`;
   // daily snapshot KPIs
@@ -1668,7 +1775,7 @@ function renderData(){
 }
 
 /* ===================== ROUTER + ACTIONS ===================== */
-const RENDER={overview:renderOverview,alerts:renderAlerts,alloc:renderAlloc,sets:renderSets,fast:renderFast,assort:renderAssort,rebal:renderRebalance,pull:renderPull,ai:renderAI,data:renderData};
+const RENDER={overview:renderOverview,alerts:renderAlerts,alloc:renderAlloc,sets:renderSets,fast:renderFast,assort:renderAssort,rebal:renderRebalance,pull:renderPull,reorder:renderReorder,ai:renderAI,data:renderData};
 let current='overview';
 function go(v){
   current=v;
@@ -1681,6 +1788,7 @@ function go(v){
   if(v==='assort') fillAssort();
   if(v==='rebal') fillRebalance();
   if(v==='pull') fillPull();
+  if(v==='reorder') fillReorder();
   if(v==='data') mountFallback();
   window.scrollTo(0,0);
 }
