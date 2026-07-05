@@ -241,6 +241,7 @@
     <div class="nav-item" data-view="reports"><span class="ico">▧</span> Reports</div>
 
     <div class="nav-label">Admin</div>
+    <div class="nav-item" data-view="users"><span class="ico">👥</span> Users &amp; Roles</div>
     <div class="nav-item" data-view="settings"><span class="ico">⚙</span> Settings</div>
     <div class="nav-item" data-view="data"><span class="ico">⎙</span> Sync Status</div>
     <div class="nav-item" data-view="activity"><span class="ico">≣</span> Activity Log</div>
@@ -930,7 +931,7 @@ const TITLES={overview:['Replenishment','Overview'],alerts:['Demand Signal','Fas
   sizecurve:['Analytics','Size Curve &amp; Broken Sizes'], setcomp:['Alerts','Set Completion Alerts'],
   partial:['Replenish &amp; Dispatch','Partial Dispatch Tracking'], dispatch:['Replenish &amp; Dispatch','Dispatch Recommendations'],
   dhistory:['Replenish &amp; Dispatch','Dispatch History'], reports:['Intelligence','Reports'],
-  settings:['Admin','Settings'], activity:['Admin','Activity Log']};
+  settings:['Admin','Settings'], activity:['Admin','Activity Log'], users:['Admin','Users &amp; Roles']};
 
 function badges(){
   const alert=(id,n)=>{const e=document.getElementById(id);if(e){e.textContent=n;e.className='cnt'+(n>0?'':' muted');}};
@@ -1894,6 +1895,77 @@ function saveSettings(){
 }
 function resetSettings(){ try{ localStorage.removeItem('ars_cfg'); }catch(e){} location.reload(); }
 
+/* ---------- Users & Roles (prototype — becomes real with the backend) ---------- */
+const ROLES={
+  admin :{label:'Admin',          tone:'info', desc:'Full access, plus manage users and settings',        access:'Everything'},
+  merch :{label:'Merchandiser',   tone:'ok',   desc:'Planning, allocation, sets and analytics',           access:'Dashboard · Analytics · Planning · Alerts · Reorder'},
+  buyer :{label:'Buyer',          tone:'ok',   desc:'Reorder and size-curve planning',                    access:'Dashboard · Analytics · Reorder · Size Curve'},
+  ops   :{label:'Dispatch / Ops', tone:'med',  desc:'Dispatch, transfers and pull-back execution',        access:'Dashboard · Dispatch · Rebalance · Pull-Back · Partial'},
+  store :{label:'Store Manager',  tone:'med',  desc:'Their store’s alerts and stock — acknowledge only',  access:'Their store: Alerts · Stock Visibility'},
+  viewer:{label:'Viewer',         tone:'flat', desc:'Read-only across the whole console',                  access:'View everything · no actions'},
+};
+const TASK_AREAS=['Fast-Size Alerts','Set Completion','Reorder Decisions','Dispatch Approvals','Stock Rebalance','Pull-Back'];
+function loadUsers(){
+  try{ const u=JSON.parse(localStorage.getItem('ars_users')||'null'); if(u&&u.length) return u; }catch(e){}
+  return [ // seed with known stakeholders as examples — edit or remove freely
+    {id:'u1',name:'Harsh Modi', email:'harsh@mulmul.in', role:'admin', stores:'All', tasks:['Reorder Decisions'], active:true},
+    {id:'u2',name:'Aryan',      email:'aryan@mulmul.in', role:'admin', stores:'All', tasks:['Fast-Size Alerts','Reorder Decisions'], active:true},
+    {id:'u3',name:'Vimal',      email:'vimal@mulmul.in', role:'ops',   stores:'All', tasks:['Dispatch Approvals','Stock Rebalance'], active:true},
+  ];
+}
+let usersState=loadUsers();
+function saveUsers(){ try{ localStorage.setItem('ars_users', JSON.stringify(usersState)); }catch(e){} }
+function addUser(){
+  const name=(document.getElementById('nu-name').value||'').trim();
+  if(!name){ toast('Enter a name'); return; }
+  usersState.push({ id:'u'+Date.now(), name,
+    email:(document.getElementById('nu-email').value||'').trim(),
+    role:document.getElementById('nu-role').value,
+    stores:(document.getElementById('nu-stores').value||'All').trim()||'All',
+    tasks:[], active:true });
+  saveUsers(); toast('User added'); go('users');
+}
+function delUser(id){ usersState=usersState.filter(u=>u.id!==id); saveUsers(); toast('User removed'); go('users'); }
+function setUserField(id,f,v){ const u=usersState.find(x=>x.id===id); if(u){ u[f]=v; saveUsers(); if(f==='role') go('users'); } }
+function toggleUserActive(id){ const u=usersState.find(x=>x.id===id); if(u){ u.active=!u.active; saveUsers(); go('users'); } }
+function toggleUserTask(id,area){ const u=usersState.find(x=>x.id===id); if(!u)return; u.tasks=u.tasks||[];
+  const i=u.tasks.indexOf(area); if(i>=0)u.tasks.splice(i,1); else u.tasks.push(area); saveUsers(); go('users'); }
+function renderUsers(){
+  const roleOpts=cur=>Object.keys(ROLES).map(k=>`<option value="${k}"${cur===k?' selected':''}>${ROLES[k].label}</option>`).join('');
+  let h=`<p class="lead">Create the people who use the console and set what each can do. Assign the alert types each person owns so work routes to the right hands.</p>`;
+  h+=`<div class="note indigo" style="margin-bottom:20px"><span>ⓘ</span><div>This is a working prototype saved on <b>this device only</b>. Real sign-in, team-wide sharing, and enforced role permissions arrive with the database backend — the same phase that powers Dispatch approvals and the Activity Log. The roles and assignments you set here carry straight into it.</div></div>`;
+  h+=`<div class="card" style="margin-bottom:18px"><div class="card-h"><h3>Add a user</h3></div>
+    <div class="card-b" style="display:grid;grid-template-columns:1.2fr 1.4fr 1fr 1fr auto;gap:14px;align-items:flex-end">
+      <div class="fld"><label>Name</label><input id="nu-name" placeholder="Full name" style="min-width:0;width:100%"></div>
+      <div class="fld"><label>Email</label><input id="nu-email" placeholder="name@mulmul.in" style="min-width:0;width:100%"></div>
+      <div class="fld"><label>Role</label><select id="nu-role" style="min-width:0;width:100%">${roleOpts('merch')}</select></div>
+      <div class="fld"><label>Stores</label><input id="nu-stores" placeholder="All or Ludhiana, Juhu" style="min-width:0;width:100%"></div>
+      <button class="btn primary" onclick="addUser()">Add user</button>
+    </div></div>`;
+  h+=`<div class="card" style="margin-bottom:18px"><div class="card-h"><h3>Team</h3><div class="sub">${usersState.length} users</div></div>
+    <div style="overflow-x:auto"><table><thead><tr><th>Name</th><th>Role</th><th>Stores</th><th>Owns (task areas)</th><th class="c">Status</th><th></th></tr></thead><tbody>`;
+  h+=usersState.map(u=>{
+    const chips=TASK_AREAS.map(a=>{ const on=(u.tasks||[]).includes(a);
+      return `<span onclick="toggleUserTask('${u.id}','${a}')" style="cursor:pointer;user-select:none;font-size:10.5px;font-weight:600;padding:3px 8px;border-radius:20px;white-space:nowrap;
+        ${on?'background:var(--indigo-tint);color:var(--indigo)':'background:var(--surface-2);color:var(--muted);border:1px solid var(--line)'}">${a}</span>`; }).join(' ');
+    return `<tr>
+      <td><div class="style-name">${u.name}</div><div style="font-size:11.5px;color:var(--muted)">${u.email||'—'}</div></td>
+      <td><select onchange="setUserField('${u.id}','role',this.value)" style="min-width:150px;padding:6px 9px">${roleOpts(u.role)}</select></td>
+      <td><input value="${u.stores||'All'}" onchange="setUserField('${u.id}','stores',this.value)" style="min-width:120px;padding:6px 9px;width:130px"></td>
+      <td style="max-width:340px"><div style="display:flex;flex-wrap:wrap;gap:5px">${chips}</div></td>
+      <td class="c"><span onclick="toggleUserActive('${u.id}')" style="cursor:pointer" class="pill ${u.active?'ok':'flat'}">${u.active?'Active':'Inactive'}</span></td>
+      <td class="c"><span onclick="if(confirm('Remove ${u.name.replace(/'/g,'')}?'))delUser('${u.id}')" style="cursor:pointer;color:var(--terracotta);font-weight:600">Remove</span></td>
+    </tr>`; }).join('');
+  h+=`</tbody></table></div></div>`;
+  h+=`<div class="card"><div class="card-h"><h3>Roles &amp; permissions</h3><div class="sub">what each role can do once enforcement is live</div></div>
+    <div style="overflow-x:auto"><table><thead><tr><th>Role</th><th>Description</th><th>Access</th><th class="r">People</th></tr></thead><tbody>`+
+    Object.keys(ROLES).map(k=>{ const r=ROLES[k]; const n=usersState.filter(u=>u.role===k&&u.active).length;
+      return `<tr><td><span class="pill ${r.tone}">${r.label}</span></td><td style="color:var(--ink-soft)">${r.desc}</td>
+        <td style="font-size:12.5px;color:var(--ink-soft)">${r.access}</td><td class="r qty">${n}</td></tr>`; }).join('')+
+    `</tbody></table></div></div>`;
+  return h;
+}
+
 /* ---------- placeholder pages (queued / backend-dependent) ---------- */
 function soonPage(o){
   return `<p class="lead">${o.desc}</p>
@@ -2020,7 +2092,7 @@ function renderData(){
 
 /* ===================== ROUTER + ACTIONS ===================== */
 const RENDER={overview:renderOverview,alerts:renderAlerts,alloc:renderAlloc,sets:renderSets,setcomp:renderSets,fast:renderFast,assort:renderAssort,rebal:renderRebalance,pull:renderPull,reorder:renderReorder,ai:renderAI,data:renderData,
-  invhealth:renderInvHealth,stockvis:renderStockVis,inwards:renderInwards,patterns:renderPatterns,sizecurve:renderSizeCurve,partial:renderPartial,dispatch:renderDispatch,dhistory:renderDHistory,reports:renderReports,settings:renderSettings,activity:renderActivity};
+  invhealth:renderInvHealth,stockvis:renderStockVis,inwards:renderInwards,patterns:renderPatterns,sizecurve:renderSizeCurve,partial:renderPartial,dispatch:renderDispatch,dhistory:renderDHistory,reports:renderReports,settings:renderSettings,activity:renderActivity,users:renderUsers};
 let current='overview';
 function go(v){
   current=v;
